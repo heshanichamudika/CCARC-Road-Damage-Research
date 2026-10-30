@@ -1,5 +1,11 @@
 """Data handling, RDD2022 ingestion, preprocessing and dataset definitions."""
 
+from src.data.loco_auditor import (
+    AuditCheckResult,
+    CheckStatus,
+    LOCOAuditReport,
+    RDD2022LOCOAuditor,
+)
 from src.data.loco_splitter import (
     CHINA_SUBSETS,
     LOCO_COUNTRIES,
@@ -54,4 +60,8 @@ __all__ = [
     "FoldSplitResult",
     "RDD2022LOCOSplitter",
     "create_link_or_copy",
+    "AuditCheckResult",
+    "CheckStatus",
+    "LOCOAuditReport",
+    "RDD2022LOCOAuditor",
 ]
