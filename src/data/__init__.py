@@ -1,5 +1,12 @@
 """Data handling, RDD2022 ingestion, preprocessing and dataset definitions."""
 
+from src.data.loco_splitter import (
+    CHINA_SUBSETS,
+    LOCO_COUNTRIES,
+    FoldSplitResult,
+    RDD2022LOCOSplitter,
+    create_link_or_copy,
+)
 from src.data.rdd2022_validator import (
     AnnotationStatus,
     BoundingBox,
@@ -42,4 +49,9 @@ __all__ = [
     "RDD2022YOLOConverter",
     "YOLOBox",
     "convert_pascal_to_yolo_box",
+    "CHINA_SUBSETS",
+    "LOCO_COUNTRIES",
+    "FoldSplitResult",
+    "RDD2022LOCOSplitter",
+    "create_link_or_copy",
 ]
