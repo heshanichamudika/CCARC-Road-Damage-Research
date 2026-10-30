@@ -1,0 +1,51 @@
+# ==============================================================================
+# CCARC Research Project - Default Configuration
+# ==============================================================================
+
+project:
+  name: "CCARC-Road-Damage-Research"
+  seed: 42
+  device: "cuda" # "cuda" or "cpu"
+
+dataset:
+  name: "RDD2022"
+  raw_dir: "data/raw/RDD2022"
+  processed_dir: "data/processed/RDD2022"
+  # 6 primary evaluation countries
+  countries:
+    - "Japan"
+    - "India"
+    - "Czech"
+    - "Norway"
+    - "United_States"
+    - "China"
+  # Standard 4-class taxonomy across RDD2022
+  classes:
+    0: "D00" # Longitudinal Crack
+    1: "D10" # Transverse Crack
+    2: "D20" # Alligator Crack
+    3: "D40" # Pothole
+  img_size: 640
+  batch_size: 16
+  num_workers: 4
+
+model:
+  architecture: "yolov8s"
+  pretrained_weights: "yolov8s.pt"
+  num_classes: 4
+
+evaluation:
+  protocol: "LOCO" # Leave-One-Country-Out
+  metric: "mAP50-95"
+  iou_threshold: 0.50
+  conf_threshold: 0.25
+
+ccarc:
+  # Methodological hypotheses parameters (to be verified experimentally)
+  enabled: false # Baseline: false, Proposed method: true
+  consistency_weight: 1.0
+  class_balance_alpha: 0.5
+  reliability_temperature: 1.0
+  perturbation_types:
+    - "photometric"
+    - "affine"

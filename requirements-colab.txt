@@ -1,0 +1,30 @@
+# ==============================================================================
+# CCARC Road Damage Research - Google Colab Pro Environment
+# Target Environment: Ubuntu x86_64 / Python 3.10+ / NVIDIA GPU (CUDA 12.x)
+# ==============================================================================
+
+# Deep Learning Core (Colab ships with PyTorch + CUDA pre-installed;
+# uncomment if clean alignment to PyTorch 2.4.1 is required):
+# --extra-index-url https://download.pytorch.org/whl/cu124
+# torch==2.4.1
+# torchvision==0.19.1
+
+# Object Detection Framework
+ultralytics==8.3.40
+
+# Computer Vision & Numerical Computing
+opencv-python-headless==4.10.0.84
+numpy>=1.26.4,<2.0.0
+scipy==1.14.1
+
+# Data Analysis & Metrics
+pandas>=2.2.0
+scikit-learn>=1.5.0
+matplotlib>=3.9.0
+
+# Configuration & Utilities
+pyyaml>=6.0.2
+python-dotenv>=1.0.1
+
+# Experiment Tracking (Optional for Cloud Runs)
+wandb>=0.18.0

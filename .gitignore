@@ -1,0 +1,80 @@
+# ==============================================================================
+# CCARC Road Damage Research - Git Ignore Rules
+# ==============================================================================
+
+# Python bytecode, compilations and testing caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment variables, secrets and credentials
+.env
+.env.*
+!.env.example
+secrets.toml
+.streamlit/secrets.toml
+*.pem
+*.key
+*.token
+*.cert
+credentials.json
+
+# Datasets and raw/processed imagery (RDD2022) at project root
+/data/
+/datasets/
+/RDD2022/
+*.tar
+*.tar.gz
+*.zip
+*.7z
+
+# Model weights and serialized checkpoints
+*.pt
+*.pth
+*.onnx
+*.engine
+*.bin
+*.safetensors
+/checkpoints/*
+!/checkpoints/.gitkeep
+
+# Experiment runs, artifacts, outputs and logs
+/runs/
+/experiments/runs/*
+!/experiments/runs/.gitkeep
+/experiments/logs/*
+!/experiments/logs/.gitkeep
+*.log
+wandb/
+mlruns/
+lightning_logs/
+
+# Notebook checkpoints and cloud mounts
+.ipynb_checkpoints/
+*-checkpoint.ipynb
+drive/
+gdrive/
+content/
+
+# IDEs, system and OS files
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+Thumbs.db
+desktop.ini

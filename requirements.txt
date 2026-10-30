@@ -1,0 +1,33 @@
+# ==============================================================================
+# CCARC Road Damage Research Dependencies
+# Target Python Version: 3.12.x (x86_64 / Windows)
+# ==============================================================================
+
+# Core Deep Learning Framework
+# Note: For CUDA-accelerated training (recommended), install via:
+#   pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu124
+torch==2.4.1
+torchvision==0.19.1
+
+# Object Detection Framework
+ultralytics==8.3.40
+
+# Computer Vision & Numerical Computing
+opencv-python==4.10.0.84
+numpy==1.26.4
+scipy==1.14.1
+
+# Data Analysis & Visualizations
+pandas==2.2.3
+matplotlib==3.9.2
+scikit-learn==1.5.2
+
+# Configuration & Environment Management
+pyyaml==6.0.2
+python-dotenv==1.0.1
+
+# Interactive Evaluation Dashboard
+streamlit==1.39.0
+
+# Testing & Quality Assurance
+pytest==8.3.3
