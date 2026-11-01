@@ -203,12 +203,37 @@ def test_checkpoint_paths_and_resume_detection(tmp_path: Path):
 
 
 def test_metric_extraction_schema():
-    """Verify detection metric extraction from mock validation results."""
+    """Verify detection metric extraction from mock validation results across Ultralytics versions.
+
+    Tests both:
+    1. Modern schema (Ultralytics >=8.4: box.mp, box.mr, and per-class arrays).
+    2. Legacy schema (Ultralytics <=8.3: box.p, box.r scalars).
+    """
     config = BaselineTrainingConfig()
     trainer = YOLOv8LOCOTrainer(config)
 
-    # Mock Ultralytics Results object
-    mock_box = SimpleNamespace(
+    # 1. Modern Ultralytics schema (box.mp, box.mr and per-class array p, r)
+    mock_box_modern = SimpleNamespace(
+        mp=0.6521,
+        mr=0.5843,
+        p=[0.65, 0.60, 0.68, 0.67],
+        r=[0.58, 0.55, 0.60, 0.60],
+        map50=0.6120,
+        map=0.3845,
+        ap50=[0.65, 0.60, 0.55, 0.65],
+        maps=[0.42, 0.38, 0.32, 0.42],
+    )
+    mock_results_modern = SimpleNamespace(box=mock_box_modern, fitness=0.4072)
+
+    metrics_modern = trainer._extract_metrics(mock_results_modern)
+    assert metrics_modern["precision"] == 0.6521
+    assert metrics_modern["recall"] == 0.5843
+    assert metrics_modern["map50"] == 0.6120
+    assert metrics_modern["map50_95"] == 0.3845
+    assert metrics_modern["fitness"] == 0.4072
+
+    # 2. Legacy Ultralytics schema (box.p, box.r scalars)
+    mock_box_legacy = SimpleNamespace(
         p=0.6521,
         r=0.5843,
         map50=0.6120,
@@ -216,16 +241,16 @@ def test_metric_extraction_schema():
         ap50=[0.65, 0.60, 0.55, 0.65],
         maps=[0.42, 0.38, 0.32, 0.42],
     )
-    mock_results = SimpleNamespace(box=mock_box, fitness=0.4072)
+    mock_results_legacy = SimpleNamespace(box=mock_box_legacy, fitness=0.4072)
 
-    metrics = trainer._extract_metrics(mock_results)
-    assert metrics["precision"] == 0.6521
-    assert metrics["recall"] == 0.5843
-    assert metrics["map50"] == 0.6120
-    assert metrics["map50_95"] == 0.3845
-    assert metrics["fitness"] == 0.4072
+    metrics_legacy = trainer._extract_metrics(mock_results_legacy)
+    assert metrics_legacy["precision"] == 0.6521
+    assert metrics_legacy["recall"] == 0.5843
+    assert metrics_legacy["map50"] == 0.6120
+    assert metrics_legacy["map50_95"] == 0.3845
+    assert metrics_legacy["fitness"] == 0.4072
 
-    per_class = metrics["per_class"]
+    per_class = metrics_modern["per_class"]
     for cls_name in ["D00", "D10", "D20", "D40"]:
         assert cls_name in per_class
         assert "ap50" in per_class[cls_name]

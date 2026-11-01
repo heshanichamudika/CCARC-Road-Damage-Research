@@ -71,35 +71,99 @@ class ReliabilityConsistencyLoss(nn.Module):
         warmup_factor = min(1.0, (current_epoch + 1) / float(self.config.warmup_epochs))
         return self.config.consistency_weight * warmup_factor
 
+    def _unpack_multiscale_features(
+        self,
+        feats: Union[List[torch.Tensor], Tuple[torch.Tensor, ...]],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Extract classification logits and DFL from multiscale feature maps."""
+        batch_size = feats[0].shape[0]
+        # Flatten spatial dimensions and concatenate across strides: (B, no, total_anchors)
+        concat_feats = torch.cat([xi.view(batch_size, self.no, -1) for xi in feats], dim=2)
+        # Split channels into bbox DFL (reg_max * 4) and classification logits (nc)
+        pred_distri, pred_scores = concat_feats.split((self.reg_max * 4, self.num_classes), dim=1)
+        pred_scores = pred_scores.permute(0, 2, 1).contiguous()  # (B, total_anchors, nc)
+        pred_distri = pred_distri.permute(0, 2, 1).contiguous()  # (B, total_anchors, 64)
+        return pred_scores, pred_distri
+
     def unpack_predictions(
         self,
-        preds: Union[torch.Tensor, List[torch.Tensor], Tuple[Any, ...]],
+        preds: Union[torch.Tensor, List[torch.Tensor], Tuple[Any, ...], Dict[str, Any]],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Extract classification logits and optional bbox distribution from YOLO output.
 
         Handles:
-        1. List of multi-stride feature tensors from YOLOv8 detect head:
+        1. Ultralytics >=8.4 detection prediction dictionary:
+           {'boxes': (B, 64, num_anchors), 'scores': (B, nc, num_anchors), 'feats': [...]}
+           or {'one2many': {'boxes': ..., 'scores': ...}}
+        2. Tuple wrappers, e.g. (inference_boxes, pred_dict) or (inference_boxes, feats).
+        3. List/tuple of multi-stride feature tensors from YOLOv8 detect head (legacy Ultralytics <=8.3):
            [(B, 68, 80, 80), (B, 68, 40, 40), (B, 68, 20, 20)]
-        2. Permuted tensor of shape (B, num_anchors, num_classes) or (B, num_anchors, no).
+        4. Permuted tensor of shape (B, num_anchors, num_classes) or (B, num_anchors, no).
 
         Returns:
             Tuple of:
                 - pred_scores: (B, num_anchors, num_classes) classification logits.
                 - pred_distri: Optional (B, num_anchors, 64) DFL bbox distribution.
+                  (None if boxes are decoded xyxy/xywh coordinates).
         """
-        feats = preds[1] if (isinstance(preds, tuple) and len(preds) > 1 and isinstance(preds[1], (list, tuple))) else preds
+        # 1. Handle tuple structures (e.g. (y, preds_dict) or (y, feats))
+        if isinstance(preds, tuple):
+            if len(preds) > 1 and isinstance(preds[1], dict):
+                return self.unpack_predictions(preds[1])
+            if len(preds) > 0 and isinstance(preds[0], dict):
+                return self.unpack_predictions(preds[0])
+            if len(preds) > 1 and isinstance(preds[1], (list, tuple)):
+                return self._unpack_multiscale_features(preds[1])
 
-        if isinstance(feats, (list, tuple)):
-            # Multiscale feature maps from YOLOv8 detection head
-            batch_size = feats[0].shape[0]
-            # Flatten spatial dimensions and concatenate across strides: (B, no, total_anchors)
-            concat_feats = torch.cat([xi.view(batch_size, self.no, -1) for xi in feats], dim=2)
-            # Split channels into bbox DFL (reg_max * 4) and classification logits (nc)
-            pred_distri, pred_scores = concat_feats.split((self.reg_max * 4, self.num_classes), dim=1)
-            pred_scores = pred_scores.permute(0, 2, 1).contiguous()  # (B, total_anchors, nc)
-            pred_distri = pred_distri.permute(0, 2, 1).contiguous()  # (B, total_anchors, 64)
-            return pred_scores, pred_distri
+        # 2. Handle Ultralytics >=8.4 prediction dictionary
+        if isinstance(preds, dict):
+            # Resolve dual-head / end-to-end wrapper (e.g. YOLOv10 / one2many)
+            if "one2many" in preds and isinstance(preds["one2many"], dict):
+                preds = preds["one2many"]
 
+            # Key 'scores' contains raw classification logits from detect head cls branch:
+            # Standard shape from forward_head: (bs, self.nc, total_anchors)
+            if "scores" in preds and preds["scores"] is not None:
+                scores = preds["scores"]
+                if scores.ndim == 3:
+                    if scores.shape[1] == self.num_classes:
+                        pred_scores = scores.permute(0, 2, 1).contiguous()
+                    elif scores.shape[2] == self.num_classes:
+                        pred_scores = scores.contiguous()
+                    else:
+                        raise ValueError(
+                            f"Prediction dictionary scores shape {scores.shape} does not match "
+                            f"num_classes={self.num_classes} in dim 1 or dim 2."
+                        )
+                elif scores.ndim == 2 and scores.shape[-1] == self.num_classes:
+                    pred_scores = scores.unsqueeze(1).contiguous()
+                else:
+                    raise ValueError(f"Unexpected prediction dictionary scores shape: {scores.shape}")
+
+                # Bounding boxes / DFL distribution:
+                # Do NOT blindly treat decoded boxes (4 coordinates) as raw DFL distribution (64 values)!
+                pred_distri = None
+                if "boxes" in preds and preds["boxes"] is not None:
+                    boxes = preds["boxes"]
+                    if boxes.ndim == 3:
+                        if boxes.shape[1] == self.reg_max * 4:
+                            pred_distri = boxes.permute(0, 2, 1).contiguous()
+                        elif boxes.shape[2] == self.reg_max * 4:
+                            pred_distri = boxes.contiguous()
+                        elif boxes.shape[1] == 4 or boxes.shape[2] == 4:
+                            # Decoded coordinates (xyxy / xywh), not DFL distribution
+                            pred_distri = None
+
+                return pred_scores, pred_distri
+
+            if "feats" in preds and isinstance(preds["feats"], (list, tuple)):
+                return self._unpack_multiscale_features(preds["feats"])
+
+        # 3. Handle multiscale feature maps list/tuple (Ultralytics <=8.3)
+        if isinstance(preds, (list, tuple)):
+            return self._unpack_multiscale_features(preds)
+
+        # 4. Handle direct tensor predictions
         if isinstance(preds, torch.Tensor):
             if preds.shape[-1] == self.num_classes:
                 return preds, None
@@ -112,8 +176,8 @@ class ReliabilityConsistencyLoss(nn.Module):
                 return pred_scores.permute(0, 2, 1).contiguous(), pred_distri.permute(0, 2, 1).contiguous()
 
         raise ValueError(
-            f"Unable to unpack predictions of type {type(preds)} and shape "
-            f"{getattr(preds, 'shape', [getattr(p, 'shape', None) for p in preds] if isinstance(preds, (list, tuple)) else None)}"
+            f"Unable to unpack predictions of type {type(preds)} and structure "
+            f"{list(preds.keys()) if isinstance(preds, dict) else getattr(preds, 'shape', None)}"
         )
 
     def forward(

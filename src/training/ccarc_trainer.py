@@ -206,7 +206,17 @@ class CCARCDetectionTrainer(DetectionTrainer):
 
             # Scale consistency loss by batch size to align magnitude with supervised loss
             batch_sz = img.shape[0]
-            total_loss = sup_loss + con_loss * batch_sz
+
+            # In Ultralytics 8.4+, criterion returns loss * batch_size as a 1D vector (box, cls, dfl),
+            # whereas in Ultralytics <=8.3, criterion returns loss.sum() * batch_size as a scalar.
+            # By extracting the scalar sum here, we guarantee total_loss is a scalar and con_loss is added
+            # exactly once rather than being broadcasted across vector components.
+            if isinstance(sup_loss, torch.Tensor) and sup_loss.ndim > 0:
+                sup_loss_scalar = sup_loss.sum()
+            else:
+                sup_loss_scalar = sup_loss
+
+            total_loss = sup_loss_scalar + con_loss * batch_sz
 
             return total_loss, loss_items
 
@@ -506,14 +516,44 @@ class CCARCLOCOTrainer:
         return summary
 
     def _extract_metrics(self, val_results: Any) -> Dict[str, Any]:
-        """Extract standardized detection metrics from Ultralytics validation results."""
+        """Extract standardized detection metrics from Ultralytics validation results.
+
+        Compatible with both modern Ultralytics (>=8.4: box.mp, box.mr, array p/r)
+        and legacy Ultralytics (<=8.3: box.p, box.r scalars).
+        """
         box = getattr(val_results, "box", None)
         res_dict = getattr(val_results, "results_dict", {})
 
-        p = float(getattr(box, "p", res_dict.get("metrics/precision(B)", 0.0)))
-        r = float(getattr(box, "r", res_dict.get("metrics/recall(B)", 0.0)))
-        map50 = float(getattr(box, "map50", res_dict.get("metrics/mAP50(B)", 0.0)))
-        map50_95 = float(getattr(box, "map", res_dict.get("metrics/mAP50-95(B)", 0.0)))
+        p_val = getattr(box, "mp", None)
+        if p_val is None:
+            p_val = getattr(box, "p", None)
+        if p_val is None:
+            p_val = res_dict.get("metrics/precision(B)", 0.0)
+        elif isinstance(p_val, (list, tuple, np.ndarray)):
+            p_val = float(np.mean(p_val)) if len(p_val) > 0 else 0.0
+        p = float(p_val)
+
+        r_val = getattr(box, "mr", None)
+        if r_val is None:
+            r_val = getattr(box, "r", None)
+        if r_val is None:
+            r_val = res_dict.get("metrics/recall(B)", 0.0)
+        elif isinstance(r_val, (list, tuple, np.ndarray)):
+            r_val = float(np.mean(r_val)) if len(r_val) > 0 else 0.0
+        r = float(r_val)
+
+        map50_val = getattr(box, "map50", None)
+        if map50_val is None:
+            map50_val = res_dict.get("metrics/mAP50(B)", 0.0)
+        map50 = float(map50_val)
+
+        map_val = getattr(box, "map", None)
+        if map_val is None:
+            map_val = getattr(box, "map50_95", None)
+        if map_val is None:
+            map_val = res_dict.get("metrics/mAP50-95(B)", 0.0)
+        map50_95 = float(map_val)
+
         fitness = float(getattr(val_results, "fitness", 0.1 * map50 + 0.9 * map50_95))
 
         per_class: Dict[str, Dict[str, float]] = {}

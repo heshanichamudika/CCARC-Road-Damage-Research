@@ -92,15 +92,19 @@ def test_full_forward_backward_optimizer_step(variant: str):
             t_preds = model(x_w)
         s_preds = model(x_s)
         sup_loss, _ = model.criterion(s_preds, batch)
+        # Handle scalar total loss across Ultralytics versions (8.3 scalar, 8.4 vector)
+        sup_loss_scalar = sup_loss.sum() if (isinstance(sup_loss, torch.Tensor) and sup_loss.ndim > 0) else sup_loss
         rwc_res = rwc_module(t_preds, s_preds, current_epoch=0)
-        total_loss = sup_loss + rwc_res["loss"] * 2
+        total_loss = sup_loss_scalar + rwc_res["loss"] * 2
     else:
         s_preds = model(batch["img"])
         sup_loss, _ = model.criterion(s_preds, batch)
-        total_loss = sup_loss
+        # Handle scalar total loss across Ultralytics versions (8.3 scalar, 8.4 vector)
+        sup_loss_scalar = sup_loss.sum() if (isinstance(sup_loss, torch.Tensor) and sup_loss.ndim > 0) else sup_loss
+        total_loss = sup_loss_scalar
 
     # Verify finite loss
-    assert torch.isfinite(total_loss)
+    assert bool(torch.isfinite(total_loss).all()) if total_loss.ndim > 0 else bool(torch.isfinite(total_loss))
     assert total_loss.item() > 0.0
 
     # Backward

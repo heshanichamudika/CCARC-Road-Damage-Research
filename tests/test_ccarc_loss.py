@@ -212,3 +212,24 @@ def test_class_weighted_bce_gradient_propagation():
 
     expected_grads = -0.5 * weights
     assert torch.allclose(pred_zero.grad.squeeze(), expected_grads, atol=1e-5)
+
+
+def test_scalar_supervised_loss_extraction_across_ultralytics_formats():
+    """Verify scalar supervised loss extraction across Ultralytics 8.3 and 8.4 return conventions."""
+    # Format 1: Ultralytics <=8.3 returns scalar total loss: loss.sum() * batch_size
+    scalar_loss = torch.tensor(15.4, requires_grad=True)
+    extracted_1 = scalar_loss.sum() if scalar_loss.ndim > 0 else scalar_loss
+    assert extracted_1.ndim == 0
+    assert pytest.approx(extracted_1.item(), rel=1e-5) == 15.4
+
+    # Format 2: Ultralytics >=8.4 returns 1D vector: loss * batch_size = [box, cls, dfl]
+    # Summing across components yields the scalar total loss without double-counting
+    vector_loss = torch.tensor([5.2, 4.1, 6.1], requires_grad=True)
+    extracted_2 = vector_loss.sum() if vector_loss.ndim > 0 else vector_loss
+    assert extracted_2.ndim == 0
+    assert pytest.approx(extracted_2.item(), rel=1e-5) == 15.4
+
+    # Verify backward propagation through extracted scalar loss
+    extracted_2.backward()
+    assert vector_loss.grad is not None
+    assert torch.allclose(vector_loss.grad, torch.ones_like(vector_loss))

@@ -216,3 +216,91 @@ def test_disabled_loss_and_warmup_schedule():
     assert pytest.approx(loss_warm.get_effective_weight(current_epoch=3), rel=1e-5) == 2.0
     # Epoch 10 (past warmup): capped at 2.0
     assert pytest.approx(loss_warm.get_effective_weight(current_epoch=10), rel=1e-5) == 2.0
+
+
+def test_dict_prediction_unpacking_standard_8_4():
+    """Verify prediction dictionary unpacking for Ultralytics 8.4 format (scores: B, nc, A; boxes: B, 64, A)."""
+    loss_module = ReliabilityConsistencyLoss()
+    b, anchors, nc = 2, 300, 4
+    pred_dict = {
+        "boxes": torch.randn(b, 64, anchors),
+        "scores": torch.randn(b, nc, anchors),
+        "feats": [torch.randn(b, 68, 20, 20)],
+    }
+
+    scores, distri = loss_module.unpack_predictions(pred_dict)
+    assert scores.shape == (b, anchors, nc)
+    assert distri is not None
+    assert distri.shape == (b, anchors, 64)
+
+
+def test_dict_prediction_with_decoded_boxes():
+    """Verify decoded boxes (4 coordinates) are never treated as raw DFL distribution."""
+    loss_module = ReliabilityConsistencyLoss()
+    b, anchors, nc = 2, 150, 4
+    # Shape with 4 box coordinates (xyxy / xywh)
+    pred_dict = {
+        "boxes": torch.randn(b, 4, anchors),
+        "scores": torch.randn(b, nc, anchors),
+    }
+
+    scores, distri = loss_module.unpack_predictions(pred_dict)
+    assert scores.shape == (b, anchors, nc)
+    assert distri is None  # Must NOT be treated as 64-channel DFL!
+
+
+def test_dict_prediction_one2many_and_tuple_wrapper():
+    """Verify one2many dictionary key and tuple (y, pred_dict) wrappers are handled seamlessly."""
+    loss_module = ReliabilityConsistencyLoss()
+    b, anchors, nc = 2, 200, 4
+    inner_dict = {
+        "boxes": torch.randn(b, 64, anchors),
+        "scores": torch.randn(b, nc, anchors),
+    }
+
+    # Case A: one2many dictionary
+    one2many_dict = {"one2many": inner_dict}
+    scores_a, distri_a = loss_module.unpack_predictions(one2many_dict)
+    assert scores_a.shape == (b, anchors, nc)
+    assert distri_a.shape == (b, anchors, 64)
+
+    # Case B: tuple wrapper (inference_tensor, pred_dict)
+    tuple_wrapper = (torch.randn(b, 84, anchors), inner_dict)
+    scores_b, distri_b = loss_module.unpack_predictions(tuple_wrapper)
+    assert scores_b.shape == (b, anchors, nc)
+    assert distri_b.shape == (b, anchors, 64)
+
+
+def test_dict_prediction_teacher_detachment_and_student_gradients():
+    """Verify teacher detachment and student gradient backpropagation with dictionary predictions."""
+    loss_module = ReliabilityConsistencyLoss(
+        ReliabilityConsistencyConfig(
+            consistency_weight=1.5,
+            confidence_threshold=0.20,
+            warmup_epochs=0,
+        )
+    )
+    b, anchors, nc = 2, 100, 4
+
+    teacher_scores = torch.randn(b, nc, anchors, requires_grad=True)
+    student_scores = torch.randn(b, nc, anchors, requires_grad=True)
+
+    # Force reliable anchor in teacher
+    with torch.no_grad():
+        teacher_scores[0, 1, 0] = 5.0  # sigmoid(5.0) ~= 0.993 > 0.20
+
+    teacher_dict = {"scores": teacher_scores, "boxes": torch.randn(b, 64, anchors)}
+    student_dict = {"scores": student_scores, "boxes": torch.randn(b, 64, anchors)}
+
+    res = loss_module(teacher_dict, student_dict, current_epoch=0)
+    loss = res["loss"]
+
+    assert loss > 0.0
+    loss.backward()
+
+    # Student must have gradients
+    assert student_scores.grad is not None
+    assert (student_scores.grad != 0).any()
+
+    # Teacher must NOT have gradients
+    assert teacher_scores.grad is None or (teacher_scores.grad == 0).all()
