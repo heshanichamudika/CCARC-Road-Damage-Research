@@ -61,16 +61,42 @@ class CCARCDetectionTrainer(DetectionTrainer):
     3. RWC: Wraps model.loss() to compute dual weak/strong forward passes and consistency regularizer.
     """
 
+    _ACTIVE_CCARC_CONFIG: Optional[CCARCTrainingConfig] = None
+
     def __init__(self, overrides: Optional[Dict[str, Any]] = None, _callbacks: Optional[Any] = None) -> None:
-        """Initialize trainer with overrides."""
+        """Initialize trainer with overrides, separating CCARC-specific arguments from YOLO config."""
+        custom_cfg: Dict[str, Any] = {}
+        if overrides is not None:
+            overrides = dict(overrides)
+            # Pop custom CCARC keys so only valid YOLO arguments reach get_cfg()
+            for key in ("ccarc_config", "cbs_enabled", "cal_enabled", "rwc_enabled", "target_country", "trainer"):
+                if key in overrides:
+                    custom_cfg[key] = overrides.pop(key)
+
         super().__init__(overrides=overrides, _callbacks=_callbacks)
 
-        # Retrieve CCARC configuration or initialize default
-        self.ccarc_cfg: Optional[CCARCTrainingConfig] = getattr(self.args, "ccarc_config", None)
-        self.cbs_enabled: bool = getattr(self.args, "cbs_enabled", True)
-        self.cal_enabled: bool = getattr(self.args, "cal_enabled", True)
-        self.rwc_enabled: bool = getattr(self.args, "rwc_enabled", True)
-        self.target_country: Optional[str] = getattr(self.args, "target_country", None)
+        # Retrieve CCARC configuration from custom_cfg, or fall back to class-level context
+        self.ccarc_cfg: Optional[CCARCTrainingConfig] = custom_cfg.get(
+            "ccarc_config", CCARCDetectionTrainer._ACTIVE_CCARC_CONFIG
+        )
+        if self.ccarc_cfg is not None:
+            CCARCDetectionTrainer._ACTIVE_CCARC_CONFIG = self.ccarc_cfg
+            self.cbs_enabled: bool = bool(custom_cfg.get("cbs_enabled", self.ccarc_cfg.cbs_enabled))
+            self.cal_enabled: bool = bool(custom_cfg.get("cal_enabled", self.ccarc_cfg.cal_enabled))
+            self.rwc_enabled: bool = bool(custom_cfg.get("rwc_enabled", self.ccarc_cfg.rwc_enabled))
+            self.target_country: Optional[str] = custom_cfg.get("target_country", self.ccarc_cfg.target_country)
+        else:
+            self.cbs_enabled: bool = bool(custom_cfg.get("cbs_enabled", False))
+            self.cal_enabled: bool = bool(custom_cfg.get("cal_enabled", False))
+            self.rwc_enabled: bool = bool(custom_cfg.get("rwc_enabled", False))
+            self.target_country: Optional[str] = custom_cfg.get("target_country", None)
+
+        # Attach custom attributes to self.args for downstream hook access
+        setattr(self.args, "ccarc_config", self.ccarc_cfg)
+        setattr(self.args, "cbs_enabled", self.cbs_enabled)
+        setattr(self.args, "cal_enabled", self.cal_enabled)
+        setattr(self.args, "rwc_enabled", self.rwc_enabled)
+        setattr(self.args, "target_country", self.target_country)
 
         self.cbs_sampler: Optional[CountryBalancedBatchSampler] = None
         self.class_weights: Optional[torch.Tensor] = None
@@ -472,7 +498,8 @@ class CCARCLOCOTrainer:
         if resume_training:
             train_args["resume"] = True
 
-        # Pass CCARC parameters to trainer via train_args
+        # Pass CCARC parameters to trainer via train_args and class context
+        CCARCDetectionTrainer._ACTIVE_CCARC_CONFIG = self.config
         train_args["trainer"] = CCARCDetectionTrainer
         train_args["ccarc_config"] = self.config
         train_args["cbs_enabled"] = self.config.cbs_enabled

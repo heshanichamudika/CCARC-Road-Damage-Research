@@ -262,3 +262,89 @@ def test_ccarc_cli_dry_run(tmp_path: Path):
     with open(report_file, "r") as f:
         rep = json.load(f)
     assert rep["status"] == "PASS"
+
+
+@pytest.mark.parametrize("variant,expected_cbs,expected_cal,expected_rwc", [
+    ("E0", False, False, False),
+    ("E1", True, False, False),
+    ("E2", False, True, False),
+    ("E3", False, False, True),
+    ("E4", True, True, True),
+])
+def test_custom_trainer_argument_separation(
+    tmp_path: Path, variant: str, expected_cbs: bool, expected_cal: bool, expected_rwc: bool
+):
+    """Verify CCARCDetectionTrainer cleanly separates custom arguments before YOLO get_cfg() across all variants."""
+    import yaml
+    from ultralytics.cfg import get_cfg
+
+    # 1. Verify that raw overrides containing custom CCARC keys would raise SyntaxError in get_cfg
+    raw_custom_args = {
+        "ccarc_config": "mock_obj",
+        "cbs_enabled": True,
+        "cal_enabled": True,
+        "rwc_enabled": True,
+        "target_country": "Norway",
+        "trainer": CCARCDetectionTrainer,
+    }
+    with pytest.raises(SyntaxError, match="is not a valid YOLO argument"):
+        get_cfg(overrides=dict(raw_custom_args))
+
+    # 2. Create minimal dummy data.yaml
+    data_yaml = tmp_path / "data.yaml"
+    with open(data_yaml, "w") as f:
+        yaml.dump({
+            "path": str(tmp_path),
+            "train": ".",
+            "val": ".",
+            "names": {0: "D00", 1: "D10", 2: "D20", 3: "D40"},
+        }, f)
+
+    # 3. Configure CCARCTrainingConfig for the variant
+    cfg = CCARCTrainingConfig(
+        experiment_variant=variant,
+        fold_idx=4,
+        target_country="Norway",
+        data_yaml_path=str(data_yaml),
+        project_dir=str(tmp_path / "experiments"),
+    )
+
+    overrides = {
+        "model": "yolov8s.yaml",
+        "data": str(data_yaml),
+        "trainer": CCARCDetectionTrainer,
+        "ccarc_config": cfg,
+        "cbs_enabled": cfg.cbs_enabled,
+        "cal_enabled": cfg.cal_enabled,
+        "rwc_enabled": cfg.rwc_enabled,
+        "target_country": cfg.target_country,
+        "project": str(tmp_path / "runs"),
+        "epochs": 1,
+        "batch": 2,
+    }
+
+    # 4. Instantiate CCARCDetectionTrainer - must NOT raise SyntaxError
+    trainer = CCARCDetectionTrainer(overrides=overrides)
+
+    # 5. Verify flags on trainer instance
+    assert trainer.cbs_enabled == expected_cbs
+    assert trainer.cal_enabled == expected_cal
+    assert trainer.rwc_enabled == expected_rwc
+    assert trainer.target_country == "Norway"
+    assert trainer.ccarc_cfg is cfg
+
+    # 6. Verify flags attached to trainer.args
+    assert trainer.args.cbs_enabled == expected_cbs
+    assert trainer.args.cal_enabled == expected_cal
+    assert trainer.args.rwc_enabled == expected_rwc
+    assert trainer.args.target_country == "Norway"
+    assert trainer.args.ccarc_config is cfg
+
+    # 7. Verify RWC sub-component initialization
+    if expected_rwc:
+        assert trainer.perturbation is not None
+        assert trainer.rwc_loss is not None
+    else:
+        assert trainer.perturbation is None
+        assert trainer.rwc_loss is None
+
