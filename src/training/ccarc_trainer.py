@@ -8,6 +8,7 @@ test data, supports safe resumption, and isolates outputs from baseline runs.
 
 from __future__ import annotations
 
+from copy import copy
 from collections import Counter
 from datetime import datetime, timezone
 import json
@@ -24,7 +25,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import ultralytics
 from ultralytics import YOLO
-from ultralytics.models.yolo.detect import DetectionTrainer
+from ultralytics.models.yolo.detect import DetectionTrainer, DetectionValidator
 from ultralytics.utils import LOGGER, RANK
 import yaml
 
@@ -54,6 +55,69 @@ from src.training.ccarc_sampler import (
     load_manifest_country_lookup,
     seed_worker,
 )
+
+
+class CCARCCompoundLoss:
+    """Compound loss callable wrapping Supervised Detection Loss + Reliability Consistency Regularizer.
+
+    Defined at module level to ensure full pickle-compatibility with torch.save / multiprocessing.
+    """
+
+    def __init__(
+        self,
+        raw_model: Any,
+        perturbation: PhotometricPerturbation,
+        rwc_loss: ReliabilityConsistencyLoss,
+        epoch: int = 0,
+    ) -> None:
+        self.raw_model = raw_model
+        self.perturb_module = perturbation
+        self.rwc_module = rwc_loss
+        self.epoch = epoch
+
+    def set_epoch(self, epoch: int) -> None:
+        """Update current training epoch for RWC ramp-up schedule."""
+        self.epoch = epoch
+
+    def __call__(
+        self, batch: Dict[str, Any], preds: Optional[Any] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Execute dual weak/strong forward passes and compute combined loss."""
+        img = batch["img"]
+        # Ensure model criterion is initialized
+        if getattr(self.raw_model, "criterion", None) is None:
+            self.raw_model.criterion = self.raw_model.init_criterion()
+
+        # Generate weak view (teacher) and strong view (student)
+        x_w, x_s = self.perturb_module.generate_pair(img)
+
+        # Teacher forward pass (detached gradients)
+        with torch.no_grad():
+            teacher_preds = self.raw_model.forward(x_w)
+
+        # Student forward pass (maintains autograd graph)
+        student_preds = self.raw_model.forward(x_s)
+
+        # Supervised detection loss on student predictions
+        sup_loss, loss_items = self.raw_model.criterion(student_preds, batch)
+
+        # Reliability consistency loss using synchronized epoch
+        rwc_result = self.rwc_module(teacher_preds, student_preds, current_epoch=self.epoch)
+        con_loss = rwc_result["loss"]
+
+        # Scale consistency loss by batch size to align magnitude with supervised loss
+        batch_sz = img.shape[0]
+
+        # In Ultralytics 8.4+, criterion returns loss * batch_size as a 1D vector (box, cls, dfl),
+        # whereas in Ultralytics <=8.3, criterion returns loss.sum() * batch_size as a scalar.
+        if isinstance(sup_loss, torch.Tensor) and sup_loss.ndim > 0:
+            sup_loss_scalar = sup_loss.sum()
+        else:
+            sup_loss_scalar = sup_loss
+
+        total_loss = sup_loss_scalar + con_loss * batch_sz
+
+        return total_loss, loss_items
 
 
 class CCARCDetectionTrainer(DetectionTrainer):
@@ -95,12 +159,10 @@ class CCARCDetectionTrainer(DetectionTrainer):
             self.rwc_enabled: bool = bool(custom_cfg.get("rwc_enabled", False))
             self.target_country: Optional[str] = custom_cfg.get("target_country", None)
 
-        # Attach custom attributes to self.args for downstream hook access
-        setattr(self.args, "ccarc_config", self.ccarc_cfg)
-        setattr(self.args, "cbs_enabled", self.cbs_enabled)
-        setattr(self.args, "cal_enabled", self.cal_enabled)
-        setattr(self.args, "rwc_enabled", self.rwc_enabled)
-        setattr(self.args, "target_country", self.target_country)
+        # Note: CCARC configuration must NEVER be attached to self.args.
+        # Ultralytics passes copy(self.args) to DetectionValidator (triggering get_cfg check_dict_alignment),
+        # serializes vars(self.args) into checkpoints ('train_args'), and saves args.yaml.
+        # All CCARC attributes are maintained strictly on self (self.ccarc_cfg, self.cbs_enabled, etc.).
 
         self.cbs_sampler: Optional[CountryBalancedBatchSampler] = None
         self.class_weights: Optional[torch.Tensor] = None
@@ -167,6 +229,23 @@ class CCARCDetectionTrainer(DetectionTrainer):
 
         return super().get_dataloader(dataset_path, batch_size, rank, mode)
 
+    def get_validator(self) -> DetectionValidator:
+        """Returns a DetectionValidator for YOLO model validation with sanitized arguments.
+
+        Ensures that any custom CCARC parameters are stripped from validator overrides so
+        that Ultralytics get_cfg() / check_dict_alignment() succeeds cleanly.
+        """
+        self.loss_names = "box_loss", "cls_loss", "dfl_loss"
+        val_args = copy(self.args)
+        for key in ("ccarc_config", "cbs_enabled", "cal_enabled", "rwc_enabled", "target_country", "trainer"):
+            if hasattr(val_args, key):
+                delattr(val_args, key)
+            elif isinstance(val_args, dict) and key in val_args:
+                val_args.pop(key, None)
+        return DetectionValidator(
+            self.test_loader, save_dir=self.save_dir, args=val_args, _callbacks=self.callbacks
+        )
+
     def set_model_attributes(self) -> None:
         """Attach hyperparameters, class weights (CAL), and RWC consistency wrapper."""
         super().set_model_attributes()
@@ -215,54 +294,26 @@ class CCARCDetectionTrainer(DetectionTrainer):
         if orig_loss_fn is None or getattr(raw_model, "_ccarc_rwc_wrapped", False):
             return
 
-        perturb_module = self.perturbation
-        rwc_module = self.rwc_loss
-        trainer_ref = self
-
-        def ccarc_compound_loss(batch: Dict[str, Any], preds: Optional[Any] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-            """Compound loss: Supervised Detection Loss + Reliability Consistency Regularizer."""
-            img = batch["img"]
-            # Ensure model criterion is initialized
-            if getattr(raw_model, "criterion", None) is None:
-                raw_model.criterion = raw_model.init_criterion()
-
-            # Generate weak view (teacher) and strong view (student)
-            x_w, x_s = perturb_module.generate_pair(img)
-
-            # Teacher forward pass (detached gradients)
-            with torch.no_grad():
-                teacher_preds = raw_model.forward(x_w)
-
-            # Student forward pass (maintains autograd graph)
-            student_preds = raw_model.forward(x_s)
-
-            # Supervised detection loss on student predictions
-            sup_loss, loss_items = raw_model.criterion(student_preds, batch)
-
-            # Reliability consistency loss
-            current_epoch = getattr(trainer_ref, "epoch", 0)
-            rwc_result = rwc_module(teacher_preds, student_preds, current_epoch=current_epoch)
-            con_loss = rwc_result["loss"]
-
-            # Scale consistency loss by batch size to align magnitude with supervised loss
-            batch_sz = img.shape[0]
-
-            # In Ultralytics 8.4+, criterion returns loss * batch_size as a 1D vector (box, cls, dfl),
-            # whereas in Ultralytics <=8.3, criterion returns loss.sum() * batch_size as a scalar.
-            # By extracting the scalar sum here, we guarantee total_loss is a scalar and con_loss is added
-            # exactly once rather than being broadcasted across vector components.
-            if isinstance(sup_loss, torch.Tensor) and sup_loss.ndim > 0:
-                sup_loss_scalar = sup_loss.sum()
-            else:
-                sup_loss_scalar = sup_loss
-
-            total_loss = sup_loss_scalar + con_loss * batch_sz
-
-            return total_loss, loss_items
-
-        raw_model.loss = ccarc_compound_loss
+        raw_model.loss = CCARCCompoundLoss(
+            raw_model=raw_model,
+            perturbation=self.perturbation,
+            rwc_loss=self.rwc_loss,
+            epoch=getattr(self, "epoch", 0),
+        )
         raw_model._ccarc_rwc_wrapped = True
         LOGGER.info("[CCARC RWC] Successfully wrapped model with Reliability-Weighted Consistency loss.")
+
+    def save_model(self) -> None:
+        """Save model training checkpoints, ensuring EMA model and train_args remain clean."""
+        # Ensure EMA model does not serialize custom instance-level loss wrappers
+        if hasattr(self, "ema") and self.ema is not None and hasattr(self.ema, "ema"):
+            raw_ema = resolve_detection_model(self.ema.ema)
+            if "loss" in raw_ema.__dict__:
+                del raw_ema.loss
+            if "_ccarc_rwc_wrapped" in raw_ema.__dict__:
+                del raw_ema._ccarc_rwc_wrapped
+
+        super().save_model()
 
 
 class CCARCLOCOTrainer:
@@ -528,6 +579,10 @@ class CCARCLOCOTrainer:
         def on_train_epoch_start_callback(trainer_obj: Any) -> None:
             if hasattr(trainer_obj, "cbs_sampler") and trainer_obj.cbs_sampler is not None:
                 trainer_obj.cbs_sampler.set_epoch(trainer_obj.epoch)
+            raw_m = resolve_detection_model(getattr(trainer_obj, "model", None))
+            loss_fn = getattr(raw_m, "loss", None)
+            if hasattr(loss_fn, "set_epoch"):
+                loss_fn.set_epoch(trainer_obj.epoch)
 
         model.add_callback("on_fit_epoch_end", on_fit_epoch_end_callback)
         model.add_callback("on_train_epoch_start", on_train_epoch_start_callback)

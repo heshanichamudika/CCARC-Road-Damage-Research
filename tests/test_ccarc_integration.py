@@ -334,14 +334,18 @@ def test_custom_trainer_argument_separation(
     assert trainer.target_country == "Norway"
     assert trainer.ccarc_cfg is cfg
 
-    # 6. Verify flags attached to trainer.args
-    assert trainer.args.cbs_enabled == expected_cbs
-    assert trainer.args.cal_enabled == expected_cal
-    assert trainer.args.rwc_enabled == expected_rwc
-    assert trainer.args.target_country == "Norway"
-    assert trainer.args.ccarc_config is cfg
+    # 6. Verify flags are strictly isolated from trainer.args to protect validator & checkpoints
+    for custom_key in ("ccarc_config", "cbs_enabled", "cal_enabled", "rwc_enabled", "target_country"):
+        assert not hasattr(trainer.args, custom_key), f"Key '{custom_key}' leaked into trainer.args!"
 
-    # 7. Verify RWC sub-component initialization
+    # 7. Verify validator creation succeeds without SyntaxError
+    trainer.test_loader = None
+    validator = trainer.get_validator()
+    assert validator is not None
+    for custom_key in ("ccarc_config", "cbs_enabled", "cal_enabled", "rwc_enabled", "target_country"):
+        assert not hasattr(validator.args, custom_key), f"Key '{custom_key}' leaked into validator.args!"
+
+    # 8. Verify RWC sub-component initialization
     if expected_rwc:
         assert trainer.perturbation is not None
         assert trainer.rwc_loss is not None
@@ -442,5 +446,136 @@ def test_trainer_set_model_attributes_and_cal_activation(
         grads = [p.grad for p in trainer.model.parameters() if p.grad is not None]
         assert len(grads) > 0
         assert all(torch.isfinite(g).all() for g in grads)
+
+
+def test_validator_configuration_error_reproduction_and_ccarc_fix(tmp_path: Path):
+    """Reproduce validator SyntaxError when custom keys leak into args, and verify CCARC isolation fix."""
+    from copy import copy
+    import yaml
+    from ultralytics.cfg import get_cfg
+    from ultralytics.models.yolo.detect import DetectionValidator
+
+    # 1. Reproduce failure: get_cfg raises SyntaxError when custom keys exist in validator args
+    leaked_args = get_cfg()
+    leaked_args.cbs_enabled = True
+    leaked_args.target_country = "Norway"
+    with pytest.raises(SyntaxError, match="is not a valid YOLO argument"):
+        DetectionValidator(args=copy(leaked_args))
+
+    # 2. Verify CCARCDetectionTrainer validator initialization produces clean validator
+    data_yaml = tmp_path / "data.yaml"
+    with open(data_yaml, "w") as f:
+        yaml.dump({
+            "path": str(tmp_path),
+            "train": ".",
+            "val": ".",
+            "names": {0: "D00", 1: "D10", 2: "D20", 3: "D40"},
+        }, f)
+
+    cfg = CCARCTrainingConfig(
+        experiment_variant="E4",
+        fold_idx=4,
+        target_country="Norway",
+        data_yaml_path=str(data_yaml),
+        project_dir=str(tmp_path / "experiments"),
+    )
+    overrides = {
+        "model": "yolov8s.yaml",
+        "data": str(data_yaml),
+        "trainer": CCARCDetectionTrainer,
+        "ccarc_config": cfg,
+        "cbs_enabled": True,
+        "cal_enabled": True,
+        "rwc_enabled": True,
+        "target_country": "Norway",
+        "project": str(tmp_path / "runs"),
+        "epochs": 1,
+        "batch": 2,
+    }
+    trainer = CCARCDetectionTrainer(overrides=overrides)
+    trainer.test_loader = None
+    validator = trainer.get_validator()
+    assert validator is not None
+    assert not hasattr(trainer.args, "cbs_enabled")
+    assert not hasattr(trainer.args, "ccarc_config")
+    assert not hasattr(validator.args, "cbs_enabled")
+    assert not hasattr(validator.args, "ccarc_config")
+    # Verify CCARC config remains active on the trainer itself
+    assert trainer.cbs_enabled is True
+    assert trainer.cal_enabled is True
+    assert trainer.rwc_enabled is True
+    assert trainer.target_country == "Norway"
+    assert trainer.ccarc_cfg is cfg
+
+
+def test_full_cpu_training_validation_checkpoint_integration(tmp_path: Path):
+    """Run an end-to-end 1-epoch CPU training and validation test with CCARC E4."""
+    import cv2
+    import numpy as np
+    import yaml
+
+    img_dir = tmp_path / "images" / "train"
+    lbl_dir = tmp_path / "labels" / "train"
+    img_dir.mkdir(parents=True)
+    lbl_dir.mkdir(parents=True)
+
+    # Create 2 synthetic images and labels for source countries
+    cv2.imwrite(str(img_dir / "Japan_01.jpg"), np.zeros((64, 64, 3), dtype=np.uint8))
+    cv2.imwrite(str(img_dir / "Czech_01.jpg"), np.zeros((64, 64, 3), dtype=np.uint8))
+    (lbl_dir / "Japan_01.txt").write_text("0 0.5 0.5 0.2 0.2\n")
+    (lbl_dir / "Czech_01.txt").write_text("1 0.5 0.5 0.2 0.2\n")
+
+    data_yaml = tmp_path / "data.yaml"
+    data_yaml.write_text(yaml.dump({
+        "path": str(tmp_path),
+        "train": "images/train",
+        "val": "images/train",
+        "names": {0: "D00", 1: "D10", 2: "D20", 3: "D40"},
+    }))
+
+    cfg = CCARCTrainingConfig(
+        experiment_variant="E4",
+        fold_idx=4,
+        target_country="Norway",
+        data_yaml_path=str(data_yaml),
+        project_dir=str(tmp_path / "exp"),
+        epochs=1,
+        batch_size=2,
+        img_size=64,
+    )
+    train_args = {
+        "model": "yolov8n.yaml",
+        "data": str(data_yaml),
+        "trainer": CCARCDetectionTrainer,
+        "ccarc_config": cfg,
+        "cbs_enabled": True,
+        "cal_enabled": True,
+        "rwc_enabled": True,
+        "target_country": "Norway",
+        "project": str(tmp_path / "runs"),
+        "name": "test_e4_integration_cpu",
+        "epochs": 1,
+        "batch": 2,
+        "imgsz": 64,
+        "device": "cpu",
+        "workers": 0,
+        "val": True,
+        "plots": False,
+        "save": True,
+    }
+
+    trainer = CCARCDetectionTrainer(overrides=train_args)
+    trainer.train()
+
+    # Verify artifacts and checkpoint creation
+    weights_dir = tmp_path / "runs" / "test_e4_integration_cpu" / "weights"
+    assert (weights_dir / "last.pt").is_file()
+    assert (weights_dir / "best.pt").is_file()
+
+    # Verify that saved checkpoint loads cleanly with YOLO without SyntaxError
+    from ultralytics import YOLO
+    saved_model = YOLO(str(weights_dir / "best.pt"))
+    assert saved_model is not None
+
 
 
