@@ -9,6 +9,10 @@ from src.evaluation.metrics import (
     extract_detection_metrics,
     normalize_metrics_dict,
 )
+from src.evaluation.loco_leakage_audit import (
+    ComprehensiveLOCOAuditor,
+    LOCOLeakageAuditSummary,
+)
 from src.evaluation.report_generator import (
     EvaluationReportGenerator,
     VARIANT_DESCRIPTIONS,
@@ -28,4 +32,6 @@ __all__ = [
     "VARIANT_DESCRIPTIONS",
     "RWCGradientAuditResult",
     "audit_rwc_gradients",
+    "ComprehensiveLOCOAuditor",
+    "LOCOLeakageAuditSummary",
 ]
