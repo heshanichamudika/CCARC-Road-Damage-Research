@@ -19,14 +19,39 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Un
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Sampler
+from torch.utils.data import DataLoader, Sampler
 
 try:
-    from ultralytics.data.build import InfiniteDataLoader, seed_worker, PIN_MEMORY
+    from ultralytics.data.build import _RepeatSampler
 except ImportError:
-    from torch.utils.data import DataLoader as InfiniteDataLoader  # type: ignore[assignment,misc]
-    seed_worker = None
-    PIN_MEMORY = True
+    class _RepeatSampler:  # type: ignore[no-redef]
+        """Sampler that repeats forever."""
+
+        def __init__(self, sampler: Any) -> None:
+            self.sampler = sampler
+
+        def __iter__(self) -> Iterator[Any]:
+            while True:
+                yield from iter(self.sampler)
+
+try:
+    from ultralytics.data.build import InfiniteDataLoader
+except ImportError:
+    InfiniteDataLoader = DataLoader  # type: ignore[assignment,misc]
+
+try:
+    from ultralytics.data.build import seed_worker
+except ImportError:
+    def seed_worker(worker_id: int) -> None:  # type: ignore[no-redef]
+        """Set dataloader worker seed for reproducibility."""
+        worker_seed = torch.initial_seed() % (2**32)
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
+try:
+    from ultralytics.data.build import PIN_MEMORY
+except ImportError:
+    PIN_MEMORY = torch.cuda.is_available()
 
 from src.data.loco_splitter import CHINA_SUBSETS, LOCO_COUNTRIES
 
@@ -534,15 +559,18 @@ class CBSSamplerProxy(Sampler[int]):
             self.cbs_sampler.set_epoch(epoch)
 
 
-class CCARCInfiniteDataLoader(InfiniteDataLoader):
-    """InfiniteDataLoader subclass preserving integer batch_size and CBS sampler for Ultralytics.
+class CCARCInfiniteDataLoader(DataLoader):
+    """Infinite DataLoader preserving integer batch_size, CBS batch sampling, and reset() for Ultralytics.
 
     PyTorch's DataLoader.__init__ unconditionally sets self.batch_size = None when a
     batch_sampler is provided. Ultralytics 8.4+ (_build_train_pipeline) evaluates:
         final_batch_size = len(self.train_loader.sampler) % self.train_loader.batch_size or self.train_loader.batch_size
 
-    This subclass preserves self.batch_size as the genuine integer batch_size and
-    attaches CBSSamplerProxy to self.sampler, ensuring full compatibility with Ultralytics 8.4+.
+    This class:
+    1. Preserves self.batch_size as the genuine integer batch_size.
+    2. Attaches CBSSamplerProxy to self.sampler for epoch and length synchronization.
+    3. Reuses workers indefinitely via _RepeatSampler for high-throughput training.
+    4. Implements reset() so that mosaic closing (close_mosaic) and transform updates succeed.
     """
 
     def __init__(
@@ -554,10 +582,39 @@ class CCARCInfiniteDataLoader(InfiniteDataLoader):
     ) -> None:
         super().__init__(*args, **kwargs)
         object.__setattr__(self, "batch_size", int(batch_size))
+        self.cbs_sampler = cbs_sampler
+
         if cbs_sampler is not None:
             total_samples = getattr(
                 cbs_sampler, "total_source_samples", len(getattr(self, "dataset", []))
             )
             proxy = CBSSamplerProxy(cbs_sampler, total_samples)
             object.__setattr__(self, "sampler", proxy)
+
+        # Wrap batch_sampler in _RepeatSampler for infinite worker recycling
+        if not isinstance(self.batch_sampler, _RepeatSampler):
+            object.__setattr__(self, "batch_sampler", _RepeatSampler(self.batch_sampler))
+
+        self.iterator = self._get_iterator()
+
+    def __len__(self) -> int:
+        """Returns the length of the batch sampler."""
+        if hasattr(self.batch_sampler, "sampler"):
+            return len(self.batch_sampler.sampler)
+        if hasattr(self.batch_sampler, "__len__"):
+            return len(self.batch_sampler)
+        ds_len = len(getattr(self, "dataset", []))
+        bs = getattr(self, "batch_size", 1) or 1
+        return ds_len // bs
+
+    def __iter__(self) -> Iterator[Any]:
+        """Creates an iterator that recycles workers across epochs."""
+        if not hasattr(self, "iterator") or self.iterator is None:
+            self.reset()
+        for _ in range(len(self)):
+            yield next(self.iterator)
+
+    def reset(self) -> None:
+        """Reset the internal iterator for mosaic closing or transform updates."""
+        self.iterator = self._get_iterator()
 

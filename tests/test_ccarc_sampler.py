@@ -454,3 +454,81 @@ def test_cbs_sampler_proxy_epoch_synchronization():
     assert batch_sampler.epoch == 5
     assert len(proxy) == len(samples)
 
+
+def test_ccarc_infinite_dataloader_reset_mosaic_update_and_cbs_preservation():
+    """Verify CCARCInfiniteDataLoader.reset() works, updates dynamic dataset transforms, and preserves CBS."""
+    class DynamicTransformDataset(Dataset):
+        def __init__(self, samples):
+            self.samples = samples
+            self.mosaic = True
+
+        def __len__(self):
+            return len(self.samples)
+
+        def __getitem__(self, idx):
+            country = resolve_sample_country(self.samples[idx])
+            return {
+                "idx": idx,
+                "country": country,
+                "is_mosaic": self.mosaic,
+            }
+
+        def close_mosaic(self):
+            self.mosaic = False
+
+    samples = [
+        "China_01.jpg", "Czech_01.jpg", "India_01.jpg", "Japan_01.jpg", "United_States_01.jpg",
+        "China_02.jpg", "Czech_02.jpg", "India_02.jpg", "Japan_02.jpg", "United_States_02.jpg",
+    ]
+    dataset = DynamicTransformDataset(samples)
+    batch_size = 5
+    batch_sampler = CountryBalancedBatchSampler(
+        samples=samples,
+        batch_size=batch_size,
+        target_country="Norway",
+        seed=42,
+    )
+
+    loader = CCARCInfiniteDataLoader(
+        dataset,
+        batch_sampler=batch_sampler,
+        batch_size=batch_size,
+        cbs_sampler=batch_sampler,
+        num_workers=0,
+    )
+
+    # 1. Verify attributes and reset method existence
+    assert hasattr(loader, "reset")
+    assert callable(loader.reset)
+    assert isinstance(loader.batch_size, int)
+    assert loader.batch_size == 5
+
+    # 2. Iterate first epoch: mosaic is True
+    first_epoch_batches = list(loader)
+    assert len(first_epoch_batches) == len(batch_sampler)
+    for b in first_epoch_batches:
+        assert all(b["is_mosaic"])
+        # Check country representation
+        assert set(b["country"]) == {"China", "Czech", "India", "Japan", "United_States"}
+
+    # 3. Simulate Ultralytics mosaic closing and call loader.reset()
+    dataset.close_mosaic()
+    loader.reset()
+
+    # 4. Verify properties after reset
+    assert isinstance(loader.batch_size, int)
+    assert loader.batch_size == 5
+    assert hasattr(loader.sampler, "set_epoch")
+
+    # 5. Verify that second epoch receives updated transforms (is_mosaic is False) and preserves CBS
+    second_epoch_batches = list(loader)
+    assert len(second_epoch_batches) == len(batch_sampler)
+    for b in second_epoch_batches:
+        assert not any(b["is_mosaic"])
+        assert set(b["country"]) == {"China", "Czech", "India", "Japan", "United_States"}
+
+    # 6. Verify epoch synchronization
+    loader.sampler.set_epoch(10)
+    assert batch_sampler.epoch == 10
+
+

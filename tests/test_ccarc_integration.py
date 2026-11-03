@@ -555,6 +555,7 @@ def test_full_cpu_training_validation_checkpoint_integration(tmp_path: Path):
         "project": str(tmp_path / "runs"),
         "name": "test_e4_integration_cpu",
         "epochs": 1,
+        "close_mosaic": 10,  # Explicitly trigger close_mosaic at epoch 0 to test train_loader.reset()
         "batch": 2,
         "imgsz": 64,
         "device": "cpu",
