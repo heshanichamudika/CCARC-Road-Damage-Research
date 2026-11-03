@@ -37,6 +37,7 @@ from src.models.ccarc_consistency import (
 from src.models.ccarc_loss import (
     ClassAwareLearningConfig,
     ClassWeightedBCEWithLogitsLoss,
+    _sync_loss_device_dtype,
     attach_class_aware_loss,
     compute_class_weights,
     extract_source_train_class_counts,
@@ -97,6 +98,10 @@ class CCARCCompoundLoss:
 
         # Student forward pass (maintains autograd graph)
         student_preds = self.raw_model.forward(x_s)
+
+        # Synchronize criterion class_weights device/dtype with student predictions
+        if getattr(self.raw_model, "criterion", None) is not None:
+            _sync_loss_device_dtype(self.raw_model.criterion, student_preds)
 
         # Supervised detection loss on student predictions
         sup_loss, loss_items = self.raw_model.criterion(student_preds, batch)
@@ -278,8 +283,18 @@ class CCARCDetectionTrainer(DetectionTrainer):
                     LOGGER.warning(f"[CCARC CAL WARNING] Failed calculating class weights: {e}. Using uniform weights.")
                     self.class_weights = torch.ones(len(DEFAULT_TARGET_CLASSES))
 
-            # Inject into model criterion
+            # Move class weights to target training device
             if self.class_weights is not None:
+                target_dev = getattr(self, "device", None)
+                if target_dev is None and hasattr(self, "model"):
+                    try:
+                        target_dev = next(self.model.parameters()).device
+                    except Exception:
+                        pass
+                if target_dev is not None:
+                    self.class_weights = self.class_weights.to(target_dev)
+
+                self.model.class_weights = self.class_weights
                 attach_class_aware_loss(self.model, self.class_weights)
 
         # 2. Wrap model.loss for RWC Consistency Regularization

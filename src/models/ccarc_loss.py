@@ -258,20 +258,21 @@ class ClassWeightedBCEWithLogitsLoss(nn.Module):
         loss[..., c] = weight[c] * BCEWithLogits(pred[..., c], target[..., c])
     """
 
-    def __init__(self, class_weights: Optional[torch.Tensor] = None) -> None:
+    def __init__(self, class_weights: Optional[torch.Tensor] = None, apply_in_bce: bool = True) -> None:
         """Initialize loss with optional class weights."""
         super().__init__()
+        self.apply_in_bce = apply_in_bce
         if class_weights is not None:
             self.register_buffer("class_weights", class_weights.float())
         else:
-            self.class_weights = None
+            self.register_buffer("class_weights", None)
 
     def set_class_weights(self, class_weights: Optional[torch.Tensor]) -> None:
         """Update or register class weights tensor."""
         if class_weights is not None:
             self.register_buffer("class_weights", class_weights.float())
         else:
-            self.class_weights = None
+            self.register_buffer("class_weights", None)
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """Compute class-weighted BCE loss.
@@ -285,8 +286,10 @@ class ClassWeightedBCEWithLogitsLoss(nn.Module):
         """
         loss = F.binary_cross_entropy_with_logits(pred, target, reduction="none")
 
-        if self.class_weights is not None:
-            w = self.class_weights.to(device=pred.device, dtype=pred.dtype)
+        if self.apply_in_bce and self.class_weights is not None:
+            if self.class_weights.device != pred.device or self.class_weights.dtype != pred.dtype:
+                self.class_weights = self.class_weights.to(device=pred.device, dtype=pred.dtype)
+            w = self.class_weights
             # Reshape for broadcasting
             if pred.ndim == 3 and w.ndim == 1:
                 w = w.view(1, 1, -1)
@@ -295,6 +298,56 @@ class ClassWeightedBCEWithLogitsLoss(nn.Module):
             loss = loss * w
 
         return loss
+
+
+def _v8_loss_has_native_class_weights() -> bool:
+    """Check if the installed ultralytics v8DetectionLoss natively handles self.class_weights."""
+    try:
+        import inspect
+        from ultralytics.utils.loss import v8DetectionLoss
+        source = inspect.getsource(v8DetectionLoss.__call__)
+        return "class_weights" in source
+    except Exception:
+        return False
+
+
+def _sync_loss_device_dtype(criterion: Any, preds: Any) -> None:
+    """Ensure criterion.class_weights matches prediction tensor device and dtype without redundant transfers."""
+    cw = getattr(criterion, "class_weights", None)
+    if cw is None or not isinstance(cw, torch.Tensor):
+        return
+
+    # Extract prediction tensor to inspect device and dtype
+    feats = preds[1] if isinstance(preds, tuple) else preds
+    pred_tensor = feats[0] if isinstance(feats, (list, tuple)) else feats
+    if not isinstance(pred_tensor, torch.Tensor):
+        return
+
+    dev = pred_tensor.device
+    dt = pred_tensor.dtype
+
+    if cw.device != dev or cw.dtype != dt:
+        criterion.class_weights = cw.to(device=dev, dtype=dt)
+
+    bce = getattr(criterion, "bce", None)
+    if bce is not None and hasattr(bce, "class_weights") and isinstance(bce.class_weights, torch.Tensor):
+        if bce.class_weights.device != dev or bce.class_weights.dtype != dt:
+            bce.class_weights = bce.class_weights.to(device=dev, dtype=dt)
+
+
+def _ensure_criterion_device_sync(criterion: Any) -> None:
+    """Ensure criterion dynamically synchronizes class_weights device/dtype before loss computation."""
+    if getattr(criterion, "_ccarc_sync_wrapped", False) or isinstance(criterion, CCARCDetectionLoss):
+        return
+
+    orig_call = criterion.__call__
+
+    def wrapped_call(preds: Any, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
+        _sync_loss_device_dtype(criterion, preds)
+        return orig_call(preds, batch)
+
+    criterion.__call__ = wrapped_call
+    criterion._ccarc_sync_wrapped = True
 
 
 class CCARCDetectionLoss(v8DetectionLoss):
@@ -319,14 +372,59 @@ class CCARCDetectionLoss(v8DetectionLoss):
             tal_topk: Top-K candidates for TaskAlignedAssigner.
         """
         super().__init__(model, tal_topk=tal_topk)
-        self.class_weights = class_weights.float() if class_weights is not None else None
-        # Replace unweighted BCE with ClassWeightedBCEWithLogitsLoss
-        self.bce = ClassWeightedBCEWithLogitsLoss(self.class_weights)
+        # Infer device from model if possible
+        device = getattr(self, "device", None)
+        if device is None:
+            try:
+                device = next(model.parameters()).device
+            except Exception:
+                device = torch.device("cpu")
+
+        if class_weights is not None:
+            self.class_weights = class_weights.to(device=device, dtype=torch.float32)
+        else:
+            self.class_weights = None
+
+        native_weighting = _v8_loss_has_native_class_weights()
+        # In Ultralytics 8.4+, v8DetectionLoss natively multiplies bce_loss *= self.class_weights.
+        # To avoid double-weighting (squaring weights), apply_in_bce is disabled when native weighting exists.
+        # In Ultralytics <=8.3, apply_in_bce scales BCE inside the module.
+        self.bce = ClassWeightedBCEWithLogitsLoss(
+            self.class_weights, apply_in_bce=not native_weighting
+        )
 
     def set_class_weights(self, class_weights: Optional[torch.Tensor]) -> None:
         """Dynamically update class weights."""
-        self.class_weights = class_weights.float() if class_weights is not None else None
-        self.bce.set_class_weights(self.class_weights)
+        device = getattr(self, "device", None)
+        if device is None and self.class_weights is not None:
+            device = self.class_weights.device
+        if device is None:
+            device = torch.device("cpu")
+
+        if class_weights is not None:
+            self.class_weights = class_weights.to(device=device, dtype=torch.float32)
+        else:
+            self.class_weights = None
+
+        native_weighting = _v8_loss_has_native_class_weights()
+        if hasattr(self, "bce") and isinstance(self.bce, ClassWeightedBCEWithLogitsLoss):
+            self.bce.set_class_weights(self.class_weights)
+            self.bce.apply_in_bce = not native_weighting
+
+    def to(self, *args: Any, **kwargs: Any) -> CCARCDetectionLoss:
+        """Move loss components and class weights to specified device/dtype."""
+        if self.class_weights is not None:
+            self.class_weights = self.class_weights.to(*args, **kwargs)
+        if hasattr(self, "bce") and hasattr(self.bce, "to"):
+            self.bce.to(*args, **kwargs)
+        if hasattr(self, "bbox_loss") and hasattr(self.bbox_loss, "to"):
+            self.bbox_loss.to(*args, **kwargs)
+        return self
+
+    def __call__(self, preds: Any, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute detection loss with synchronized class weights device and dtype."""
+        _sync_loss_device_dtype(self, preds)
+        return super().__call__(preds, batch)
 
 
 def resolve_detection_model(model: Any) -> Any:
@@ -374,7 +472,7 @@ def attach_class_aware_loss(
     """Safely attach Class-Aware Learning loss to an Ultralytics model.
 
     Works across Ultralytics versions by replacing the criterion's BCE module
-    or initializing CCARCDetectionLoss.
+    or initializing CCARCDetectionLoss. Ensures class_weights matches model device.
 
     Args:
         model: Ultralytics YOLO, DetectionTrainer, or DetectionModel instance.
@@ -390,11 +488,29 @@ def attach_class_aware_loss(
     if getattr(det_model, "args", None) is None:
         det_model.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5)
 
+    # Align class_weights to model device
+    model_device = None
+    try:
+        params = list(det_model.parameters())
+        if params:
+            model_device = params[0].device
+    except Exception:
+        pass
+
+    if model_device is not None and class_weights is not None:
+        class_weights = class_weights.to(device=model_device)
+
+    det_model.class_weights = class_weights
+    native_weighting = _v8_loss_has_native_class_weights()
+
     # 1. If model already has a criterion with .bce attribute, inject ClassWeightedBCEWithLogitsLoss
     if hasattr(det_model, "criterion") and getattr(det_model, "criterion", None) is not None:
-        if hasattr(det_model.criterion, "bce"):
-            det_model.criterion.bce = ClassWeightedBCEWithLogitsLoss(class_weights)
-            return det_model.criterion
+        criterion = det_model.criterion
+        criterion.class_weights = class_weights
+        if hasattr(criterion, "bce"):
+            criterion.bce = ClassWeightedBCEWithLogitsLoss(class_weights, apply_in_bce=not native_weighting)
+        _ensure_criterion_device_sync(criterion)
+        return criterion
 
     # 2. Otherwise instantiate CCARCDetectionLoss
     criterion = CCARCDetectionLoss(det_model, class_weights=class_weights, tal_topk=tal_topk)

@@ -24,6 +24,8 @@ from src.models.ccarc_loss import (
     CCARCDetectionLoss,
     ClassAwareLearningConfig,
     ClassWeightedBCEWithLogitsLoss,
+    _sync_loss_device_dtype,
+    _v8_loss_has_native_class_weights,
     attach_class_aware_loss,
     compute_class_weights,
     extract_source_train_class_counts,
@@ -353,4 +355,117 @@ def test_cal_class_weights_affect_classification_loss():
     assert pytest.approx(loss_skewed[0, 0, 2].item() / loss_skewed[0, 0, 0].item(), rel=1e-4) == 4.0
     # Class 0 loss in skewed case must be 0.5x of uniform
     assert pytest.approx(loss_skewed[0, 0, 0].item() / loss_uniform[0, 0, 0].item(), rel=1e-4) == 0.5
+
+
+def test_class_weighted_bce_buffer_registration():
+    """Verify class_weights is properly registered as a PyTorch buffer and moves with module."""
+    weights = torch.tensor([0.8, 1.2, 2.5, 0.5])
+    loss_mod = ClassWeightedBCEWithLogitsLoss(weights)
+
+    # 1. Assert class_weights is in registered _buffers
+    assert "class_weights" in loss_mod._buffers
+    assert torch.allclose(loss_mod.class_weights, weights)
+
+    # 2. Moving module to different dtype moves buffer
+    loss_mod_half = loss_mod.to(dtype=torch.float16)
+    assert loss_mod_half.class_weights.dtype == torch.float16
+
+    # 3. Dynamic buffer update maintains buffer registry
+    new_weights = torch.tensor([1.0, 1.0, 1.0, 1.0])
+    loss_mod.set_class_weights(new_weights)
+    assert "class_weights" in loss_mod._buffers
+    assert torch.allclose(loss_mod.class_weights, new_weights)
+
+
+def test_class_weighted_bce_dynamic_dtype_sync_amp():
+    """Verify class_weights adapts dynamically to FP16 input under AMP without mismatch."""
+    weights = torch.tensor([0.7, 1.5, 2.0, 0.8], dtype=torch.float32)
+    loss_mod = ClassWeightedBCEWithLogitsLoss(weights)
+
+    # Simulated AMP tensors (FP16)
+    pred_half = torch.randn(2, 8, 4, dtype=torch.float16, requires_grad=True)
+    target_half = torch.randint(0, 2, (2, 8, 4)).to(dtype=torch.float16)
+
+    # Forward pass should not raise RuntimeError and should produce FP16 output
+    loss_half = loss_mod(pred_half, target_half)
+    assert loss_half.dtype == torch.float16
+    assert torch.isfinite(loss_half).all()
+
+    # Buffer should now match pred dtype to prevent future casting overhead
+    assert loss_mod.class_weights.dtype == torch.float16
+
+    # Backward pass should produce finite gradients
+    loss_half.sum().backward()
+    assert pred_half.grad is not None
+    assert torch.isfinite(pred_half.grad).all()
+
+
+def test_sync_loss_device_dtype_and_idempotency():
+    """Verify _sync_loss_device_dtype synchronizes device/dtype and is idempotent."""
+    from types import SimpleNamespace
+
+    # Mock criterion with CPU FP32 class weights
+    weights = torch.tensor([0.5, 1.0, 2.0, 0.5], dtype=torch.float32)
+    bce = ClassWeightedBCEWithLogitsLoss(weights)
+    mock_criterion = SimpleNamespace(class_weights=weights.clone(), bce=bce)
+
+    # Mock predictions in FP16 (as when running under autocast/AMP)
+    feats = [torch.randn(2, 64, 16, 16, dtype=torch.float16)]
+    preds = (None, feats)
+
+    # 1. Sync should update class_weights to FP16
+    _sync_loss_device_dtype(mock_criterion, preds)
+    assert mock_criterion.class_weights.dtype == torch.float16
+    assert mock_criterion.bce.class_weights.dtype == torch.float16
+
+    # 2. Idempotency: repeated call with matching device/dtype should be a no-op
+    cw_ref = mock_criterion.class_weights
+    _sync_loss_device_dtype(mock_criterion, preds)
+    assert mock_criterion.class_weights is cw_ref  # Same tensor instance, zero reallocation
+
+
+def test_cal_loss_numerical_invariance_across_device_dtype():
+    """Verify class-weighted BCE loss produces mathematically invariant results across dtypes."""
+    weights = torch.tensor([0.6, 1.4, 2.2, 0.8])
+    loss_fp32 = ClassWeightedBCEWithLogitsLoss(weights)
+    loss_fp16 = ClassWeightedBCEWithLogitsLoss(weights)
+
+    torch.manual_seed(42)
+    pred_32 = torch.randn(4, 20, 4, dtype=torch.float32)
+    target_32 = torch.randint(0, 2, (4, 20, 4)).float()
+
+    pred_16 = pred_32.to(dtype=torch.float16)
+    target_16 = target_32.to(dtype=torch.float16)
+
+    out_32 = loss_fp32(pred_32, target_32)
+    out_16 = loss_fp16(pred_16, target_16)
+
+    # Values must match within FP16 precision
+    assert torch.allclose(out_32.to(torch.float16), out_16, atol=2e-3, rtol=1e-2)
+
+
+def test_attach_class_aware_loss_sets_model_attributes_and_device():
+    """Verify attach_class_aware_loss synchronizes class_weights with DetectionModel device."""
+    from types import SimpleNamespace
+    from ultralytics.nn.tasks import DetectionModel
+
+    dm = DetectionModel("yolov8s.yaml", nc=4, verbose=False)
+    dm.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5)
+
+    weights = torch.tensor([0.7, 1.3, 2.1, 0.9])
+    criterion = attach_class_aware_loss(dm, weights)
+
+    # Both det_model and criterion must hold class_weights
+    assert hasattr(dm, "class_weights")
+    assert dm.class_weights is not None
+    assert torch.allclose(dm.class_weights.cpu(), weights)
+    assert hasattr(criterion, "class_weights")
+    assert torch.allclose(criterion.class_weights.cpu(), weights)
+
+    # If CUDA is available, test GPU transfer
+    if torch.cuda.is_available():
+        dm_cuda = dm.to("cuda:0")
+        attach_class_aware_loss(dm_cuda, weights)
+        assert dm_cuda.class_weights.device.type == "cuda"
+        assert dm_cuda.criterion.class_weights.device.type == "cuda"
 
