@@ -304,3 +304,116 @@ def test_dict_prediction_teacher_detachment_and_student_gradients():
 
     # Teacher must NOT have gradients
     assert teacher_scores.grad is None or (teacher_scores.grad == 0).all()
+
+
+def test_rwc_blur_assignment_amp_fp16_regression():
+    """Reproduce and verify fix for exact RuntimeError: expected scalar type Half but found Float.
+
+    Tests out[blur_mask] = blurred[blur_mask] when strong_blur_prob=1.0 forces blur application
+    on every sample under FP16 and simulated AMP autocast.
+    """
+    cfg = PhotometricPerturbationConfig(strong_blur_prob=1.0)
+    module = PhotometricPerturbation(cfg)
+
+    # 1. Direct FP16 input
+    x_fp16 = torch.rand(4, 3, 64, 64, dtype=torch.float16)
+    out_strong = module.generate_strong_view(x_fp16)
+    assert out_strong.dtype == torch.float16
+    assert out_strong.shape == (4, 3, 64, 64)
+    assert torch.isfinite(out_strong).all()
+
+    # 2. Paired view generation in FP16
+    x_w, x_s = module.generate_pair(x_fp16)
+    assert x_w.dtype == torch.float16
+    assert x_s.dtype == torch.float16
+    assert torch.isfinite(x_w).all()
+    assert torch.isfinite(x_s).all()
+
+    # 3. Under CPU AMP autocast (bfloat16)
+    with torch.amp.autocast("cpu", dtype=torch.bfloat16):
+        x_bf16 = torch.rand(2, 3, 32, 32, dtype=torch.bfloat16)
+        out_bf16 = module.generate_strong_view(x_bf16)
+        assert out_bf16.dtype == torch.bfloat16
+
+    # 4. If CUDA is available, test real CUDA AMP
+    if torch.cuda.is_available():
+        x_cuda_fp16 = torch.rand(2, 3, 64, 64, device="cuda:0", dtype=torch.float16)
+        with torch.cuda.amp.autocast():
+            out_cuda = module.generate_strong_view(x_cuda_fp16)
+            assert out_cuda.device.type == "cuda"
+            assert out_cuda.dtype == torch.float16
+
+
+def test_rwc_perturbations_multiple_consecutive_batches():
+    """Verify perturbation module processes multiple consecutive batches without state leakage or dtype drift."""
+    cfg = PhotometricPerturbationConfig(strong_blur_prob=0.5, strong_noise_std=0.02)
+    module = PhotometricPerturbation(cfg)
+
+    for i in range(10):
+        dtype = torch.float16 if i % 2 == 0 else torch.float32
+        x = torch.rand(3, 3, 48, 48, dtype=dtype)
+        x_w, x_s = module.generate_pair(x)
+
+        assert x_w.dtype == dtype
+        assert x_s.dtype == dtype
+        assert x_w.shape == (3, 3, 48, 48)
+        assert x_s.shape == (3, 3, 48, 48)
+        assert (x_w >= 0.0).all() and (x_w <= 1.0).all()
+        assert (x_s >= 0.0).all() and (x_s <= 1.0).all()
+
+
+def test_rwc_consistency_loss_amp_fp16_backward():
+    """Verify ReliabilityConsistencyLoss computes valid losses and gradients under FP16."""
+    loss_module = ReliabilityConsistencyLoss(
+        ReliabilityConsistencyConfig(
+            consistency_weight=1.0,
+            confidence_threshold=0.30,
+            warmup_epochs=0,
+        )
+    )
+
+    b, anchors, nc = 2, 80, 4
+    teacher_scores = torch.randn(b, anchors, nc, dtype=torch.float16, requires_grad=True)
+    student_scores = torch.randn(b, anchors, nc, dtype=torch.float16, requires_grad=True)
+
+    # Force at least one reliable anchor
+    with torch.no_grad():
+        teacher_scores[0, 5, 2] = 4.0  # sigmoid(4.0) > 0.30
+
+    res = loss_module(teacher_scores, student_scores, current_epoch=0)
+    loss = res["loss"]
+
+    assert loss.dtype == torch.float16
+    assert torch.isfinite(loss)
+    assert loss > 0.0
+
+    loss.backward()
+    assert student_scores.grad is not None
+    assert student_scores.grad.dtype == torch.float16
+    assert torch.isfinite(student_scores.grad).all()
+    assert (student_scores.grad != 0).any()
+    assert teacher_scores.grad is None or (teacher_scores.grad == 0).all()
+
+
+def test_rwc_consistency_empty_mask_fp16_differentiable_zero():
+    """Verify empty mask returns differentiable zero matching input dtype."""
+    loss_module = ReliabilityConsistencyLoss(
+        ReliabilityConsistencyConfig(
+            confidence_threshold=0.9999,  # Impossibly high threshold
+            warmup_epochs=0,
+        )
+    )
+    b, anchors, nc = 2, 40, 4
+    teacher_scores = torch.zeros(b, anchors, nc, dtype=torch.float16)
+    student_scores = torch.randn(b, anchors, nc, dtype=torch.float16, requires_grad=True)
+
+    res = loss_module(teacher_scores, student_scores, current_epoch=0)
+    loss = res["loss"]
+
+    assert loss.dtype == torch.float16
+    assert loss.item() == 0.0
+    assert res["reliable_anchor_count"].item() == 0
+
+    loss.backward()
+    assert student_scores.grad is not None
+    assert (student_scores.grad == 0.0).all()

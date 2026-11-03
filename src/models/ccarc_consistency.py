@@ -217,12 +217,12 @@ class ReliabilityConsistencyLoss(nn.Module):
         # Calculate effective weight for this epoch
         eff_weight = self.get_effective_weight(current_epoch)
         if not self.config.enabled or eff_weight <= 0.0:
-            zero_loss = 0.0 * student_scores.sum()
+            zero_loss = (0.0 * student_scores.sum()).to(dtype=student_scores.dtype)
             return {
                 "loss": zero_loss,
                 "raw_loss": zero_loss.detach(),
                 "reliable_anchor_count": torch.tensor(0, device=student_scores.device),
-                "effective_weight": torch.tensor(eff_weight, device=student_scores.device),
+                "effective_weight": torch.tensor(eff_weight, device=student_scores.device, dtype=student_scores.dtype),
             }
 
         cfg = self.config
@@ -242,12 +242,12 @@ class ReliabilityConsistencyLoss(nn.Module):
 
         # 5. Differentiable Zero when no reliable predictions exist
         if reliable_count == 0:
-            zero_loss = 0.0 * student_scores.sum()
+            zero_loss = (0.0 * student_scores.sum()).to(dtype=student_scores.dtype)
             return {
                 "loss": zero_loss,
                 "raw_loss": zero_loss.detach(),
                 "reliable_anchor_count": reliable_count,
-                "effective_weight": torch.tensor(eff_weight, device=student_scores.device),
+                "effective_weight": torch.tensor(eff_weight, device=student_scores.device, dtype=student_scores.dtype),
             }
 
         # 6. Calculate continuous reliability weights r_i
@@ -260,8 +260,8 @@ class ReliabilityConsistencyLoss(nn.Module):
         else:
             raise ValueError(f"Unknown weighting_mode: '{cfg.weighting_mode}'")
 
-        # Zero out weights of unreliable anchors
-        masked_weights = reliability_weights * reliable_mask.float()  # (B, num_anchors)
+        # Zero out weights of unreliable anchors, preserving tensor dtype
+        masked_weights = reliability_weights * reliable_mask.to(dtype=reliability_weights.dtype)  # (B, num_anchors)
 
         # 7. Compute element-wise consistency loss between student logits and teacher targets
         if cfg.loss_type == "bce":
@@ -288,12 +288,12 @@ class ReliabilityConsistencyLoss(nn.Module):
         normalizer = torch.clamp(masked_weights.sum(), min=cfg.epsilon)
         raw_loss = weighted_loss_sum / normalizer
 
-        # Final scaled loss
-        final_loss = eff_weight * raw_loss
+        # Final scaled loss, guaranteed to match student prediction device and dtype
+        final_loss = (eff_weight * raw_loss).to(device=student_scores.device, dtype=student_scores.dtype)
 
         return {
             "loss": final_loss,
             "raw_loss": raw_loss.detach(),
             "reliable_anchor_count": reliable_count,
-            "effective_weight": torch.tensor(eff_weight, device=student_scores.device),
+            "effective_weight": torch.tensor(eff_weight, device=student_scores.device, dtype=student_scores.dtype),
         }

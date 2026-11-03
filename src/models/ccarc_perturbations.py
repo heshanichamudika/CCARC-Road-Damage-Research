@@ -40,6 +40,15 @@ class PhotometricPerturbationConfig:
     strong_blur_prob: float = 0.20   # Probability of applying mild 3x3 Gaussian smoothing
 
 
+def _disable_autocast_context(device: torch.device):
+    """Context manager to safely disable autocast on any device type."""
+    dev_type = device.type if device.type in {"cuda", "cpu"} else "cpu"
+    try:
+        return torch.amp.autocast(device_type=dev_type, enabled=False)
+    except Exception:
+        return torch.cuda.amp.autocast(enabled=False) if device.type == "cuda" else torch.autocast(device_type="cpu", enabled=False)
+
+
 class PhotometricPerturbation(nn.Module):
     """Differentiable Photometric Augmentation Module for Road Imagery.
 
@@ -55,17 +64,17 @@ class PhotometricPerturbation(nn.Module):
     def _adjust_brightness(self, x: torch.Tensor, factor: torch.Tensor) -> torch.Tensor:
         """Scale brightness: x * factor."""
         # factor shape: (B, 1, 1, 1)
-        return torch.clamp(x * factor, 0.0, 1.0)
+        return torch.clamp(x * factor, 0.0, 1.0).to(dtype=x.dtype)
 
     def _adjust_contrast(self, x: torch.Tensor, factor: torch.Tensor) -> torch.Tensor:
         """Scale contrast around per-image mean luminance."""
         # x shape: (B, C, H, W)
         mean = x.mean(dim=(-2, -1), keepdim=True)
-        return torch.clamp((x - mean) * factor + mean, 0.0, 1.0)
+        return torch.clamp((x - mean) * factor + mean, 0.0, 1.0).to(dtype=x.dtype)
 
     def _adjust_gamma(self, x: torch.Tensor, gamma: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
         """Apply gamma transformation: x ** gamma."""
-        return torch.clamp(x + eps, eps, 1.0) ** gamma
+        return (torch.clamp(x + eps, eps, 1.0).pow(gamma)).to(dtype=x.dtype)
 
     def _apply_gaussian_blur(self, x: torch.Tensor) -> torch.Tensor:
         """Apply a mild 3x3 Gaussian smoothing kernel."""
@@ -74,8 +83,9 @@ class PhotometricPerturbation(nn.Module):
             [2.0, 4.0, 2.0],
             [1.0, 2.0, 1.0],
         ], device=x.device, dtype=x.dtype) / 16.0
-        kernel = kernel.repeat(x.shape[1], 1, 1, 1)
-        return F.conv2d(x, kernel, padding=1, groups=x.shape[1])
+        kernel = kernel.repeat(x.shape[1], 1, 1, 1).to(device=x.device, dtype=x.dtype)
+        blurred = F.conv2d(x, kernel, padding=1, groups=x.shape[1])
+        return blurred.to(device=x.device, dtype=x.dtype)
 
     def generate_weak_view(
         self,
@@ -91,6 +101,8 @@ class PhotometricPerturbation(nn.Module):
         Returns:
             Weakly perturbed image tensor with identical shape and dtype.
         """
+        orig_dtype = x.dtype
+        orig_device = x.device
         is_batched = x.ndim == 4
         if not is_batched:
             x = x.unsqueeze(0)
@@ -98,17 +110,19 @@ class PhotometricPerturbation(nn.Module):
         b, _, _, _ = x.shape
         cfg = self.config
 
-        # Mild random factors
-        rand_b = torch.empty(b, 1, 1, 1, device=x.device, dtype=x.dtype).uniform_(
-            1.0 - cfg.weak_brightness, 1.0 + cfg.weak_brightness, generator=generator
-        )
-        rand_c = torch.empty(b, 1, 1, 1, device=x.device, dtype=x.dtype).uniform_(
-            1.0 - cfg.weak_contrast, 1.0 + cfg.weak_contrast, generator=generator
-        )
+        # Run within disabled autocast to prevent unwanted op promotions (e.g. pow/mean)
+        with _disable_autocast_context(orig_device):
+            rand_b = torch.empty(b, 1, 1, 1, device=orig_device, dtype=orig_dtype).uniform_(
+                1.0 - cfg.weak_brightness, 1.0 + cfg.weak_brightness, generator=generator
+            )
+            rand_c = torch.empty(b, 1, 1, 1, device=orig_device, dtype=orig_dtype).uniform_(
+                1.0 - cfg.weak_contrast, 1.0 + cfg.weak_contrast, generator=generator
+            )
 
-        out = self._adjust_brightness(x, rand_b)
-        out = self._adjust_contrast(out, rand_c)
+            out = self._adjust_brightness(x, rand_b)
+            out = self._adjust_contrast(out, rand_c)
 
+        out = out.to(device=orig_device, dtype=orig_dtype)
         return out if is_batched else out.squeeze(0)
 
     def generate_strong_view(
@@ -128,6 +142,8 @@ class PhotometricPerturbation(nn.Module):
         Returns:
             Strongly perturbed image tensor with identical shape and dtype.
         """
+        orig_dtype = x.dtype
+        orig_device = x.device
         is_batched = x.ndim == 4
         if not is_batched:
             x = x.unsqueeze(0)
@@ -135,36 +151,39 @@ class PhotometricPerturbation(nn.Module):
         b, _, _, _ = x.shape
         cfg = self.config
 
-        # 1. Random Brightness
-        b_factors = torch.empty(b, 1, 1, 1, device=x.device, dtype=x.dtype).uniform_(
-            cfg.strong_brightness_min, cfg.strong_brightness_max, generator=generator
-        )
-        out = self._adjust_brightness(x, b_factors)
+        # Run within disabled autocast to prevent unwanted op promotions (e.g. conv2d/mean/pow)
+        with _disable_autocast_context(orig_device):
+            # 1. Random Brightness
+            b_factors = torch.empty(b, 1, 1, 1, device=orig_device, dtype=orig_dtype).uniform_(
+                cfg.strong_brightness_min, cfg.strong_brightness_max, generator=generator
+            )
+            out = self._adjust_brightness(x, b_factors)
 
-        # 2. Random Contrast
-        c_factors = torch.empty(b, 1, 1, 1, device=x.device, dtype=x.dtype).uniform_(
-            cfg.strong_contrast_min, cfg.strong_contrast_max, generator=generator
-        )
-        out = self._adjust_contrast(out, c_factors)
+            # 2. Random Contrast
+            c_factors = torch.empty(b, 1, 1, 1, device=orig_device, dtype=orig_dtype).uniform_(
+                cfg.strong_contrast_min, cfg.strong_contrast_max, generator=generator
+            )
+            out = self._adjust_contrast(out, c_factors)
 
-        # 3. Random Gamma
-        g_factors = torch.empty(b, 1, 1, 1, device=x.device, dtype=x.dtype).uniform_(
-            cfg.strong_gamma_min, cfg.strong_gamma_max, generator=generator
-        )
-        out = self._adjust_gamma(out, g_factors)
+            # 3. Random Gamma
+            g_factors = torch.empty(b, 1, 1, 1, device=orig_device, dtype=orig_dtype).uniform_(
+                cfg.strong_gamma_min, cfg.strong_gamma_max, generator=generator
+            )
+            out = self._adjust_gamma(out, g_factors)
 
-        # 4. Optional Gaussian Blur
-        if cfg.strong_blur_prob > 0.0:
-            blur_mask = torch.rand(b, device=x.device, generator=generator) < cfg.strong_blur_prob
-            if blur_mask.any():
-                blurred = self._apply_gaussian_blur(out)
-                out[blur_mask] = blurred[blur_mask]
+            # 4. Optional Gaussian Blur
+            if cfg.strong_blur_prob > 0.0:
+                blur_mask = torch.rand(b, device=orig_device, generator=generator) < cfg.strong_blur_prob
+                if blur_mask.any():
+                    blurred = self._apply_gaussian_blur(out).to(device=orig_device, dtype=out.dtype)
+                    out[blur_mask] = blurred[blur_mask].to(dtype=out.dtype)
 
-        # 5. Mild Gaussian Sensor Noise
-        if cfg.strong_noise_std > 0.0:
-            noise = torch.randn(out.shape, device=x.device, dtype=x.dtype, generator=generator) * cfg.strong_noise_std
-            out = torch.clamp(out + noise, 0.0, 1.0)
+            # 5. Mild Gaussian Sensor Noise
+            if cfg.strong_noise_std > 0.0:
+                noise = torch.randn(out.shape, device=orig_device, dtype=orig_dtype, generator=generator) * cfg.strong_noise_std
+                out = torch.clamp(out + noise.to(dtype=out.dtype), 0.0, 1.0)
 
+        out = out.to(device=orig_device, dtype=orig_dtype)
         return out if is_batched else out.squeeze(0)
 
     def generate_pair(
@@ -186,6 +205,6 @@ class PhotometricPerturbation(nn.Module):
             gen = torch.Generator(device=x.device)
             gen.manual_seed(seed)
 
-        x_weak = self.generate_weak_view(x, generator=gen)
-        x_strong = self.generate_strong_view(x, generator=gen)
+        x_weak = self.generate_weak_view(x, generator=gen).to(device=x.device, dtype=x.dtype)
+        x_strong = self.generate_strong_view(x, generator=gen).to(device=x.device, dtype=x.dtype)
         return x_weak, x_strong

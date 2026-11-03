@@ -120,7 +120,9 @@ class CCARCCompoundLoss:
         else:
             sup_loss_scalar = sup_loss
 
-        total_loss = sup_loss_scalar + con_loss * batch_sz
+        # Ensure con_loss matches sup_loss_scalar device and dtype exactly
+        con_loss_scaled = con_loss.to(device=sup_loss_scalar.device, dtype=sup_loss_scalar.dtype) * batch_sz
+        total_loss = sup_loss_scalar + con_loss_scaled
 
         return total_loss, loss_items
 

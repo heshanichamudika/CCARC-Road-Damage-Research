@@ -28,6 +28,7 @@ from src.models.ccarc_loss import (
     CCARCDetectionLoss,
     ClassAwareLearningConfig,
     ClassWeightedBCEWithLogitsLoss,
+    attach_class_aware_loss,
     compute_class_weights,
 )
 from src.models.ccarc_perturbations import (
@@ -577,6 +578,84 @@ def test_full_cpu_training_validation_checkpoint_integration(tmp_path: Path):
     from ultralytics import YOLO
     saved_model = YOLO(str(weights_dir / "best.pt"))
     assert saved_model is not None
+
+
+def test_e4_consecutive_batches_and_amp_simulation():
+    """Verify E4 compound loss across 3 consecutive training batches with optimizer updates under FP32 and AMP.
+
+    Ensures that photometric perturbations, CAL class weights, and RWC consistency loss
+    execute cleanly across multiple consecutive iterations with non-zero gradients and finite loss.
+    """
+    from src.training.ccarc_trainer import CCARCCompoundLoss
+
+    cfg = CCARCTrainingConfig(experiment_variant="E4", epochs=1, batch_size=2)
+    model = DetectionModel("yolov8n.yaml", nc=4, verbose=False)
+    model.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5)
+    model.criterion = model.init_criterion()
+
+    weights = torch.tensor([0.7, 1.4, 2.1, 0.8])
+    attach_class_aware_loss(model, weights)
+
+    perturb = PhotometricPerturbation(PhotometricPerturbationConfig(strong_blur_prob=0.8, strong_noise_std=0.02))
+    rwc = ReliabilityConsistencyLoss(cfg.rwc_config)
+
+    compound_loss = CCARCCompoundLoss(
+        raw_model=model,
+        perturbation=perturb,
+        rwc_loss=rwc,
+        epoch=0,
+    )
+
+    optimizer = optim.SGD(model.parameters(), lr=0.005, momentum=0.9)
+
+    # Run 3 consecutive batches
+    for batch_idx in range(3):
+        optimizer.zero_grad()
+        batch = create_synthetic_yolo_batch(batch_size=2)
+
+        # Execute full compound loss forward pass
+        loss, loss_items = compound_loss(batch)
+
+        assert torch.isfinite(loss)
+        assert loss.item() > 0.0
+
+        # Backward pass
+        loss.backward()
+
+        # Check gradients are finite and non-zero
+        grads = [p.grad for p in model.parameters() if p.grad is not None]
+        assert len(grads) > 0
+        assert all(torch.isfinite(g).all() for g in grads)
+        assert any((g != 0).any() for g in grads)
+
+        # Optimizer update
+        optimizer.step()
+
+    # Verify CUDA AMP if CUDA is available
+    if torch.cuda.is_available():
+        model_cuda = model.to("cuda:0")
+        attach_class_aware_loss(model_cuda, weights.to("cuda:0"))
+        compound_loss_cuda = CCARCCompoundLoss(
+            raw_model=model_cuda,
+            perturbation=perturb,
+            rwc_loss=rwc,
+            epoch=0,
+        )
+        optimizer_cuda = optim.SGD(model_cuda.parameters(), lr=0.005)
+
+        for _ in range(3):
+            optimizer_cuda.zero_grad()
+            batch_cuda = {
+                "batch_idx": torch.tensor([0, 1], device="cuda:0"),
+                "cls": torch.tensor([0, 1], device="cuda:0"),
+                "bboxes": torch.tensor([[0.5, 0.5, 0.2, 0.2], [0.3, 0.3, 0.1, 0.1]], device="cuda:0"),
+                "img": torch.rand(2, 3, 64, 64, device="cuda:0"),
+            }
+            with torch.cuda.amp.autocast():
+                loss, _ = compound_loss_cuda(batch_cuda)
+            assert torch.isfinite(loss)
+            loss.backward()
+            optimizer_cuda.step()
 
 
 
