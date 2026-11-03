@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import math
+import os
 from pathlib import Path
 import random
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
@@ -19,6 +20,13 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Sampler
+
+try:
+    from ultralytics.data.build import InfiniteDataLoader, seed_worker, PIN_MEMORY
+except ImportError:
+    from torch.utils.data import DataLoader as InfiniteDataLoader  # type: ignore[assignment,misc]
+    seed_worker = None
+    PIN_MEMORY = True
 
 from src.data.loco_splitter import CHINA_SUBSETS, LOCO_COUNTRIES
 
@@ -498,3 +506,58 @@ def create_country_balanced_batch_sampler(
     )
     sampler.set_epoch(epoch)
     return sampler
+
+
+class CBSSamplerProxy(Sampler[int]):
+    """Proxy sampler exposed on train_loader.sampler for Ultralytics lifecycle compatibility.
+
+    Ultralytics 8.4+ (_build_train_pipeline and DDP) queries:
+    1. len(train_loader.sampler) to calculate epoch sample count.
+    2. train_loader.sampler.set_epoch(epoch) during DDP epoch start.
+
+    This proxy ensures that both operations work seamlessly when CountryBalancedBatchSampler
+    is used as the underlying batch sampler.
+    """
+
+    def __init__(self, cbs_sampler: Any, total_samples: int) -> None:
+        self.cbs_sampler = cbs_sampler
+        self.total_samples = total_samples
+
+    def __len__(self) -> int:
+        return self.total_samples
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(self.cbs_sampler)
+
+    def set_epoch(self, epoch: int) -> None:
+        if hasattr(self.cbs_sampler, "set_epoch"):
+            self.cbs_sampler.set_epoch(epoch)
+
+
+class CCARCInfiniteDataLoader(InfiniteDataLoader):
+    """InfiniteDataLoader subclass preserving integer batch_size and CBS sampler for Ultralytics.
+
+    PyTorch's DataLoader.__init__ unconditionally sets self.batch_size = None when a
+    batch_sampler is provided. Ultralytics 8.4+ (_build_train_pipeline) evaluates:
+        final_batch_size = len(self.train_loader.sampler) % self.train_loader.batch_size or self.train_loader.batch_size
+
+    This subclass preserves self.batch_size as the genuine integer batch_size and
+    attaches CBSSamplerProxy to self.sampler, ensuring full compatibility with Ultralytics 8.4+.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        batch_size: int = 16,
+        cbs_sampler: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        object.__setattr__(self, "batch_size", int(batch_size))
+        if cbs_sampler is not None:
+            total_samples = getattr(
+                cbs_sampler, "total_source_samples", len(getattr(self, "dataset", []))
+            )
+            proxy = CBSSamplerProxy(cbs_sampler, total_samples)
+            object.__setattr__(self, "sampler", proxy)
+

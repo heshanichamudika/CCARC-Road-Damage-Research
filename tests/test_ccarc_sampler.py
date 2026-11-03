@@ -14,6 +14,8 @@ from torch.utils.data import DataLoader, Dataset
 
 from src.data.loco_splitter import CHINA_SUBSETS, LOCO_COUNTRIES
 from src.training.ccarc_sampler import (
+    CBSSamplerProxy,
+    CCARCInfiniteDataLoader,
     CountryBalancedBatchSampler,
     CountryBalancedSampler,
     build_country_index_map,
@@ -334,3 +336,121 @@ def test_unequal_country_sizes_oversampling():
     assert czech_seen > 0
     assert japan_seen > 0
     assert abs(czech_seen - japan_seen) <= len(sampler)
+
+
+def test_batch_size_none_regression_and_ultralytics_dataloader_fix():
+    """Reproduce the original batch_size=None TypeError and verify CCARCInfiniteDataLoader fix."""
+    class SimpleDataset(Dataset):
+        def __init__(self, n: int = 20):
+            self.n = n
+        def __len__(self):
+            return self.n
+        def __getitem__(self, idx):
+            return torch.tensor([idx])
+
+    dataset = SimpleDataset(20)
+    samples = [f"Japan_{i:02d}.jpg" for i in range(10)] + [f"Czech_{i:02d}.jpg" for i in range(10)]
+    batch_sampler = CountryBalancedBatchSampler(samples=samples, batch_size=4, seed=42)
+
+    # 1. Reproduce the failure: standard PyTorch DataLoader with batch_sampler sets batch_size=None
+    standard_loader = DataLoader(dataset, batch_sampler=batch_sampler)
+    assert standard_loader.batch_size is None
+
+    # This exact expression from Ultralytics 8.4+ _build_train_pipeline raises TypeError
+    with pytest.raises(TypeError, match="unsupported operand type\\(s\\) for %: 'int' and 'NoneType'"):
+        _ = len(standard_loader.sampler) % standard_loader.batch_size
+
+    # 2. Verify CCARCInfiniteDataLoader sets valid integer batch_size and integrates CBSSamplerProxy
+    cbs_loader = CCARCInfiniteDataLoader(
+        dataset,
+        batch_sampler=batch_sampler,
+        batch_size=4,
+        cbs_sampler=batch_sampler,
+        num_workers=0,
+    )
+    assert isinstance(cbs_loader.batch_size, int)
+    assert cbs_loader.batch_size == 4
+
+    # Ultralytics 8.4+ expression now evaluates cleanly without error
+    final_batch_size = len(cbs_loader.sampler) % cbs_loader.batch_size or cbs_loader.batch_size
+    assert isinstance(final_batch_size, int)
+    assert final_batch_size > 0
+
+    # Verify InfiniteDataLoader features
+    assert hasattr(cbs_loader, "reset")
+    first_batch = next(iter(cbs_loader))
+    assert first_batch.shape[0] == 4
+
+
+def test_cbs_norway_exclusion_and_five_source_countries_representation():
+    """Verify that Fold 4 excludes Norway and balances across all 5 source countries."""
+    samples = [
+        "China_Drone_01.jpg", "China_MotorBike_02.jpg",
+        "Czech_01.jpg", "Czech_02.jpg",
+        "India_01.jpg", "India_02.jpg",
+        "Japan_01.jpg", "Japan_02.jpg",
+        "United_States_01.jpg", "United_States_02.jpg",
+        "Norway_01.jpg", "Norway_02.jpg",  # Target country to isolate
+    ]
+
+    class NamedDataset(Dataset):
+        def __init__(self, files):
+            self.files = files
+        def __len__(self):
+            return len(self.files)
+        def __getitem__(self, idx):
+            return resolve_sample_country(self.files[idx])
+
+    dataset = NamedDataset(samples)
+    batch_size = 5  # 1 sample per source country
+
+    batch_sampler = CountryBalancedBatchSampler(
+        samples=samples,
+        batch_size=batch_size,
+        target_country="Norway",
+        seed=42,
+    )
+
+    # 1. Verify country partitioning
+    expected_active = ["China", "Czech", "India", "Japan", "United_States"]
+    assert sorted(batch_sampler.active_countries) == expected_active
+    assert len(batch_sampler.excluded_indices) == 2  # Both Norway samples excluded
+
+    loader = CCARCInfiniteDataLoader(
+        dataset,
+        batch_sampler=batch_sampler,
+        batch_size=batch_size,
+        cbs_sampler=batch_sampler,
+        num_workers=0,
+    )
+
+    # 2. Iterate and verify batches
+    country_totals = Counter()
+    for batch_countries in loader:
+        # Strict zero-leakage check
+        assert "Norway" not in batch_countries
+        assert len(batch_countries) == 5
+        # Verify representation in the batch
+        batch_set = set(batch_countries)
+        assert len(batch_set) == 5, f"Batch missing country representation: {batch_countries}"
+        country_totals.update(batch_countries)
+
+    # All 5 countries should have equal representation across the epoch
+    assert len(country_totals) == 5
+    counts = list(country_totals.values())
+    assert all(c == counts[0] for c in counts)
+
+
+def test_cbs_sampler_proxy_epoch_synchronization():
+    """Verify that CBSSamplerProxy propagates set_epoch to the underlying CBS sampler."""
+    samples = ["Japan_01.jpg", "Czech_01.jpg", "India_01.jpg"]
+    batch_sampler = CountryBalancedBatchSampler(samples=samples, batch_size=2, seed=42)
+
+    proxy = CBSSamplerProxy(batch_sampler, total_samples=len(samples))
+    assert hasattr(proxy, "set_epoch")
+
+    # Set epoch and verify state change
+    proxy.set_epoch(5)
+    assert batch_sampler.epoch == 5
+    assert len(proxy) == len(samples)
+

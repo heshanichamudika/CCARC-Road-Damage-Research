@@ -48,8 +48,11 @@ from src.models.ccarc_perturbations import (
 from src.training.baseline_config import check_gpu_environment
 from src.training.ccarc_config import CCARCTrainingConfig
 from src.training.ccarc_sampler import (
+    CCARCInfiniteDataLoader,
     CountryBalancedBatchSampler,
+    PIN_MEMORY,
     load_manifest_country_lookup,
+    seed_worker,
 )
 
 
@@ -144,12 +147,22 @@ class CCARCDetectionTrainer(DetectionTrainer):
             workers = getattr(self.args, "workers", 4)
             collate_fn = getattr(dataset, "collate_fn", None)
 
-            return DataLoader(
+            # Ultralytics worker count heuristic and seed generator
+            nd = torch.cuda.device_count()
+            nw = min(os.cpu_count() // max(nd, 1), workers) if os.cpu_count() else workers
+            generator = torch.Generator()
+            generator.manual_seed(6148914691236517205 + (RANK if RANK != -1 else 0))
+
+            return CCARCInfiniteDataLoader(
                 dataset,
                 batch_sampler=batch_sampler,
-                num_workers=workers,
+                batch_size=batch_size,
+                cbs_sampler=batch_sampler,
+                num_workers=nw,
+                pin_memory=PIN_MEMORY,
                 collate_fn=collate_fn,
-                pin_memory=True,
+                worker_init_fn=seed_worker,
+                generator=generator,
             )
 
         return super().get_dataloader(dataset_path, batch_size, rank, mode)
