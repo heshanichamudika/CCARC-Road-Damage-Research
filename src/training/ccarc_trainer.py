@@ -54,8 +54,17 @@ from src.training.ccarc_sampler import (
     CountryBalancedBatchSampler,
     PIN_MEMORY,
     load_manifest_country_lookup,
+    resolve_sample_country,
     seed_worker,
 )
+
+
+class CCARCSmokeBatchStop(Exception):
+    """Exception raised internally to halt training cleanly after target smoke batches execute."""
+
+    def __init__(self, diagnostics: List[Dict[str, Any]]) -> None:
+        super().__init__(f"CCARC smoke debug halt requested after {len(diagnostics)} batch(es).")
+        self.diagnostics = diagnostics
 
 
 class CCARCCompoundLoss:
@@ -75,6 +84,9 @@ class CCARCCompoundLoss:
         self.perturb_module = perturbation
         self.rwc_module = rwc_loss
         self.epoch = epoch
+        self.last_rwc_result: Optional[Dict[str, Any]] = None
+        self.last_sup_loss: Optional[float] = None
+        self.last_con_loss: Optional[float] = None
 
     def set_epoch(self, epoch: int) -> None:
         """Update current training epoch for RWC ramp-up schedule."""
@@ -124,6 +136,14 @@ class CCARCCompoundLoss:
         con_loss_scaled = con_loss.to(device=sup_loss_scalar.device, dtype=sup_loss_scalar.dtype) * batch_sz
         total_loss = sup_loss_scalar + con_loss_scaled
 
+        self.last_rwc_result = rwc_result
+        self.last_sup_loss = (
+            float(sup_loss_scalar.item()) if hasattr(sup_loss_scalar, "item") else float(sup_loss_scalar)
+        )
+        self.last_con_loss = (
+            float(con_loss_scaled.item()) if hasattr(con_loss_scaled, "item") else float(con_loss_scaled)
+        )
+
         return total_loss, loss_items
 
 
@@ -144,7 +164,15 @@ class CCARCDetectionTrainer(DetectionTrainer):
         if overrides is not None:
             overrides = dict(overrides)
             # Pop custom CCARC keys so only valid YOLO arguments reach get_cfg()
-            for key in ("ccarc_config", "cbs_enabled", "cal_enabled", "rwc_enabled", "target_country", "trainer"):
+            for key in (
+                "ccarc_config",
+                "cbs_enabled",
+                "cal_enabled",
+                "rwc_enabled",
+                "target_country",
+                "trainer",
+                "smoke_batches",
+            ):
                 if key in overrides:
                     custom_cfg[key] = overrides.pop(key)
 
@@ -160,11 +188,13 @@ class CCARCDetectionTrainer(DetectionTrainer):
             self.cal_enabled: bool = bool(custom_cfg.get("cal_enabled", self.ccarc_cfg.cal_enabled))
             self.rwc_enabled: bool = bool(custom_cfg.get("rwc_enabled", self.ccarc_cfg.rwc_enabled))
             self.target_country: Optional[str] = custom_cfg.get("target_country", self.ccarc_cfg.target_country)
+            self.smoke_batches: Optional[int] = custom_cfg.get("smoke_batches", getattr(self.ccarc_cfg, "smoke_batches", None))
         else:
             self.cbs_enabled: bool = bool(custom_cfg.get("cbs_enabled", False))
             self.cal_enabled: bool = bool(custom_cfg.get("cal_enabled", False))
             self.rwc_enabled: bool = bool(custom_cfg.get("rwc_enabled", False))
             self.target_country: Optional[str] = custom_cfg.get("target_country", None)
+            self.smoke_batches: Optional[int] = custom_cfg.get("smoke_batches", None)
 
         # Note: CCARC configuration must NEVER be attached to self.args.
         # Ultralytics passes copy(self.args) to DetectionValidator (triggering get_cfg check_dict_alignment),
@@ -181,6 +211,20 @@ class CCARCDetectionTrainer(DetectionTrainer):
             rwc_cfg = getattr(self.ccarc_cfg, "rwc_config", None) if self.ccarc_cfg else None
             self.perturbation = PhotometricPerturbation(perturb_cfg)
             self.rwc_loss = ReliabilityConsistencyLoss(rwc_cfg)
+
+        # Mini-debugging smoke batches tracking
+        self.smoke_batch_counter: int = 0
+        self.smoke_diagnostics: List[Dict[str, Any]] = []
+        self._last_opt_step_ran: bool = False
+        self._current_batch: Optional[Dict[str, Any]] = None
+
+        if self.smoke_batches is not None and self.smoke_batches > 0:
+            LOGGER.info(f"[CCARC SMOKE DEBUG] Mini-debugging mode active: target = {self.smoke_batches} batch(es).")
+            # Force accumulation to 1 so optimizer.step() executes on every smoke batch
+            self.args.nbs = self.args.batch
+            self.accumulate = 1
+            self.add_callback("on_train_batch_end", self._on_smoke_batch_end)
+            self.add_callback("on_train_epoch_end", self._on_smoke_epoch_end)
 
     def get_dataloader(self, dataset_path: str, batch_size: int = 16, rank: int = 0, mode: str = "train") -> DataLoader:
         """Construct dataloader, injecting CountryBalancedBatchSampler during training mode."""
@@ -244,7 +288,15 @@ class CCARCDetectionTrainer(DetectionTrainer):
         """
         self.loss_names = "box_loss", "cls_loss", "dfl_loss"
         val_args = copy(self.args)
-        for key in ("ccarc_config", "cbs_enabled", "cal_enabled", "rwc_enabled", "target_country", "trainer"):
+        for key in (
+            "ccarc_config",
+            "cbs_enabled",
+            "cal_enabled",
+            "rwc_enabled",
+            "target_country",
+            "trainer",
+            "smoke_batches",
+        ):
             if hasattr(val_args, key):
                 delattr(val_args, key)
             elif isinstance(val_args, dict) and key in val_args:
@@ -252,6 +304,161 @@ class CCARCDetectionTrainer(DetectionTrainer):
         return DetectionValidator(
             self.test_loader, save_dir=self.save_dir, args=val_args, _callbacks=self.callbacks
         )
+
+    def preprocess_batch(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        """Preprocess batch, saving current batch reference and enforcing accumulate=1 in smoke mode."""
+        self._current_batch = batch
+        self._last_opt_step_ran = False
+        if self.smoke_batches is not None and self.smoke_batches > 0:
+            self.accumulate = 1
+        return super().preprocess_batch(batch)
+
+    def optimizer_step(self) -> None:
+        """Execute optimizer step and record execution flag."""
+        self._last_opt_step_ran = True
+        super().optimizer_step()
+
+    def _on_smoke_batch_end(self, trainer: Any) -> None:
+        """Callback executed at the end of each training batch in smoke mode."""
+        self.smoke_batch_counter += 1
+        batch_idx = self.smoke_batch_counter
+
+        # 1. Losses
+        sup_loss_val = None
+        con_loss_val = None
+        loss_items_dict: Dict[str, float] = {}
+
+        if hasattr(self, "loss_items") and self.loss_items is not None:
+            raw_items = self.loss_items
+            if isinstance(raw_items, torch.Tensor):
+                items = [round(float(x.item()), 4) for x in raw_items.detach().cpu()]
+            else:
+                items = [round(float(x), 4) for x in raw_items]
+            if len(items) >= 3:
+                loss_items_dict = {"box": items[0], "cls": items[1], "dfl": items[2]}
+            elif len(items) == 1:
+                loss_items_dict = {"loss": items[0]}
+
+        raw_m = resolve_detection_model(getattr(self, "model", None))
+        loss_fn = getattr(raw_m, "loss", None)
+        reliable_anchor_count: Any = "N/A (RWC disabled)"
+
+        if self.rwc_enabled and isinstance(loss_fn, CCARCCompoundLoss):
+            if loss_fn.last_sup_loss is not None:
+                sup_loss_val = round(float(loss_fn.last_sup_loss), 4)
+            if loss_fn.last_con_loss is not None:
+                con_loss_val = round(float(loss_fn.last_con_loss), 4)
+            if loss_fn.last_rwc_result is not None:
+                rel_cnt = loss_fn.last_rwc_result.get("reliable_anchor_count", 0)
+                if isinstance(rel_cnt, torch.Tensor):
+                    reliable_anchor_count = int(rel_cnt.item())
+                else:
+                    reliable_anchor_count = int(rel_cnt)
+        else:
+            if hasattr(self, "loss") and self.loss is not None:
+                sup_loss_val = round(float(self.loss.item()), 4)
+            con_loss_val = "N/A (RWC disabled)"
+
+        total_loss_val = (
+            round(float(self.loss.item()), 4) if hasattr(self, "loss") and self.loss is not None else "N/A"
+        )
+
+        # 2. CAL Contribution
+        cal_info: Dict[str, Any] = {"enabled": self.cal_enabled}
+        if self.cal_enabled:
+            cal_info["cls_loss"] = loss_items_dict.get("cls", "N/A")
+            if self.class_weights is not None:
+                cal_info["weights"] = {
+                    cls: round(float(w.item()), 3) for cls, w in zip(DEFAULT_TARGET_CLASSES, self.class_weights)
+                }
+
+        # 3. GPU Memory
+        if torch.cuda.is_available():
+            alloc_mb = round(torch.cuda.memory_allocated() / (1024 ** 2), 2)
+            peak_mb = round(torch.cuda.max_memory_allocated() / (1024 ** 2), 2)
+            gpu_mem = f"{alloc_mb} MB (peak: {peak_mb} MB)"
+        else:
+            gpu_mem = "N/A (CPU execution)"
+
+        # 4. Gradient Finite Status
+        grads_finite = True
+        has_grads = False
+        if hasattr(self, "model") and isinstance(self.model, torch.nn.Module):
+            for p in self.model.parameters():
+                if p.grad is not None:
+                    has_grads = True
+                    if not torch.isfinite(p.grad).all().item():
+                        grads_finite = False
+                        break
+        grad_status = grads_finite if has_grads else "No gradients computed"
+
+        # 5. Optimizer Step Status
+        opt_step_ran = bool(getattr(self, "_last_opt_step_ran", False))
+
+        # 6. CBS Country Distribution
+        country_dist: Dict[str, int] = {}
+        if self._current_batch and "im_file" in self._current_batch:
+            for im_path in self._current_batch["im_file"]:
+                try:
+                    c = resolve_sample_country(str(im_path))
+                except Exception:
+                    c = "Unknown"
+                country_dist[c] = country_dist.get(c, 0) + 1
+        else:
+            country_dist = {"N/A": 0}
+
+        # Record diagnostic entry
+        diag = {
+            "batch": batch_idx,
+            "total_loss": total_loss_val,
+            "supervised_loss": sup_loss_val,
+            "loss_components": loss_items_dict,
+            "cal": cal_info,
+            "rwc_consistency_loss": con_loss_val,
+            "reliable_anchor_count": reliable_anchor_count,
+            "gpu_memory": gpu_mem,
+            "gradients_finite": grad_status,
+            "optimizer_step_ran": opt_step_ran,
+            "cbs_country_distribution": country_dist,
+        }
+        self.smoke_diagnostics.append(diag)
+
+        # Formatted per-batch diagnostics
+        print("\n" + "=" * 65)
+        print(f"[CCARC SMOKE BATCH {batch_idx}/{self.smoke_batches}] DIAGNOSTIC REPORT")
+        print("=" * 65)
+        print(f"  Total Loss:             {total_loss_val}")
+        print(f"  Supervised Loss:        {sup_loss_val} (box/cls/dfl: {loss_items_dict})")
+        if self.cal_enabled:
+            print(f"  CAL Contribution:       Active (cls_loss: {loss_items_dict.get('cls', 'N/A')})")
+        else:
+            print(f"  CAL Contribution:       Disabled")
+        if self.rwc_enabled:
+            print(f"  RWC Consistency Loss:   {con_loss_val}")
+            print(f"  Reliable Anchors:       {reliable_anchor_count}")
+        else:
+            print(f"  RWC Consistency Loss:   Disabled")
+        print(f"  GPU Memory Usage:       {gpu_mem}")
+        print(f"  Gradients Finite:       {grad_status}")
+        print(f"  Optimizer Step Ran:     {opt_step_ran}")
+        print(f"  CBS Country Batch Dist: {country_dist if self.cbs_enabled else f'CBS disabled (dist: {country_dist})'}")
+        print("=" * 65)
+
+        # 7. Check if target batch count reached
+        if self.smoke_batch_counter >= self.smoke_batches:
+            LOGGER.info(
+                f"[CCARC SMOKE DEBUG] Target {self.smoke_batches} smoke batch(es) completed. "
+                f"Aborting training loop cleanly."
+            )
+            raise CCARCSmokeBatchStop(diagnostics=self.smoke_diagnostics)
+
+    def _on_smoke_epoch_end(self, trainer: Any) -> None:
+        """Callback to prevent epoch validation from running during smoke batches mode."""
+        if self.smoke_batches is not None and self.smoke_batch_counter > 0:
+            LOGGER.info(
+                f"[CCARC SMOKE DEBUG] Epoch ended after {self.smoke_batch_counter} batches. Halting before validation."
+            )
+            raise CCARCSmokeBatchStop(diagnostics=self.smoke_diagnostics)
 
     def set_model_attributes(self) -> None:
         """Attach hyperparameters, class weights (CAL), and RWC consistency wrapper."""
@@ -588,10 +795,12 @@ class CCARCLOCOTrainer:
         train_args["cal_enabled"] = self.config.cal_enabled
         train_args["rwc_enabled"] = self.config.rwc_enabled
         train_args["target_country"] = self.config.target_country
+        train_args["smoke_batches"] = self.config.smoke_batches
 
         # Epoch synchronization callback
         def on_fit_epoch_end_callback(trainer_obj: Any) -> None:
-            self.sync_to_persistent()
+            if not getattr(trainer_obj, "smoke_batches", None):
+                self.sync_to_persistent()
 
         def on_train_epoch_start_callback(trainer_obj: Any) -> None:
             if hasattr(trainer_obj, "cbs_sampler") and trainer_obj.cbs_sampler is not None:
@@ -607,26 +816,52 @@ class CCARCLOCOTrainer:
         start_time = time.perf_counter()
         print(f"[STAGE 1] Starting CCARC ({self.config.experiment_variant}) for Fold {self.config.fold_idx} ({self.config.target_country})...")
         print(f"         CBS: {self.config.cbs_enabled} | CAL: {self.config.cal_enabled} | RWC: {self.config.rwc_enabled}")
+        if self.config.smoke_batches:
+            print(f"         SMOKE DEBUG: Halting after {self.config.smoke_batches} batch(es).")
 
-        train_results = model.train(**train_args)
-        elapsed_sec = time.perf_counter() - start_time
+        try:
+            train_results = model.train(**train_args)
+            elapsed_sec = time.perf_counter() - start_time
+            self.sync_to_persistent()
 
-        self.sync_to_persistent()
+            summary = {
+                "stage": f"STAGE_1_TRAINING_{self.config.experiment_variant}",
+                "fold_idx": self.config.fold_idx,
+                "target_country": self.config.target_country,
+                "elapsed_seconds": round(elapsed_sec, 2),
+                "best_checkpoint": str(self.persistent_weights_dir / "best.pt"),
+                "last_checkpoint": str(self.persistent_weights_dir / "last.pt"),
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            }
 
-        summary = {
-            "stage": f"STAGE_1_TRAINING_{self.config.experiment_variant}",
-            "fold_idx": self.config.fold_idx,
-            "target_country": self.config.target_country,
-            "elapsed_seconds": round(elapsed_sec, 2),
-            "best_checkpoint": str(self.persistent_weights_dir / "best.pt"),
-            "last_checkpoint": str(self.persistent_weights_dir / "last.pt"),
-            "completed_at": datetime.now(timezone.utc).isoformat(),
-        }
+            with open(self.persistent_experiment_dir / "train_stage_summary.json", "w", encoding="utf-8") as f:
+                json.dump(summary, f, indent=2)
 
-        with open(self.persistent_experiment_dir / "train_stage_summary.json", "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2)
+            return summary
 
-        return summary
+        except CCARCSmokeBatchStop as smoke_stop:
+            elapsed_sec = time.perf_counter() - start_time
+            print(
+                f"\n[CCARC SMOKE DEBUG] Finished executing {len(smoke_stop.diagnostics)} batch(es) "
+                f"in {elapsed_sec:.2f}s without full epoch/validation overhead."
+            )
+            summary = {
+                "stage": f"SMOKE_DEBUG_{self.config.experiment_variant}",
+                "status": "SMOKE_BATCHES_COMPLETE",
+                "fold_idx": self.config.fold_idx,
+                "target_country": self.config.target_country,
+                "smoke_batches_requested": self.config.smoke_batches,
+                "smoke_batches_executed": len(smoke_stop.diagnostics),
+                "elapsed_seconds": round(elapsed_sec, 2),
+                "cuda_available": torch.cuda.is_available(),
+                "diagnostics": smoke_stop.diagnostics,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            }
+            smoke_report_path = self.persistent_experiment_dir / "smoke_batches_report.json"
+            with open(smoke_report_path, "w", encoding="utf-8") as f:
+                json.dump(summary, f, indent=2)
+            print(f"[CCARC SMOKE DEBUG] Saved mini-debugging report to: {smoke_report_path}")
+            return summary
 
     def _extract_metrics(self, val_results: Any) -> Dict[str, Any]:
         """Extract standardized detection metrics from Ultralytics validation results.
@@ -783,6 +1018,23 @@ class CCARCLOCOTrainer:
             train_summary = self.train_stage(force_restart=force_restart)
         else:
             train_summary = {"status": "SKIPPED_EVAL_ONLY"}
+
+        # In mini-debugging smoke mode, halt immediately without evaluating checkpoints
+        if self.config.smoke_batches is not None:
+            self.persistent_experiment_dir.mkdir(parents=True, exist_ok=True)
+            master_summary = {
+                "protocol": f"CCARC_{self.config.experiment_variant}_SMOKE_DEBUG",
+                "variant": self.config.experiment_variant,
+                "fold_idx": self.config.fold_idx,
+                "target_country": self.config.target_country,
+                "dry_run": dry_run_report,
+                "stage_1_train": train_summary,
+                "smoke_mode": True,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            }
+            with open(self.persistent_experiment_dir / "smoke_master_summary.json", "w", encoding="utf-8") as f:
+                json.dump(master_summary, f, indent=2)
+            return master_summary
 
         val_summary = self.evaluate_source_val_stage()
 

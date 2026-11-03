@@ -133,6 +133,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rwc-warmup", type=int, default=5, help="RWC warmup epochs (default: 5).")
 
     # Workflow Flags
+    parser.add_argument("--smoke-batches", type=int, default=None, help="Execute exactly N training batches for GPU smoke debugging and exit safely.")
     parser.add_argument("--dry-run", action="store_true", help="Validate configurations and paths without training.")
     parser.add_argument("--resume", action="store_true", help="Resume from weights/last.pt if present.")
     parser.add_argument("--eval-target", action="store_true", help="Explicitly evaluate Stage 3 held-out target.")
@@ -140,7 +141,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--eval-only", action="store_true", help="Skip training and evaluate existing best.pt.")
     parser.add_argument("--force-restart", action="store_true", help="Force restart training even if completed.")
 
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.smoke_batches is not None and args.smoke_batches <= 0:
+        parser.error(f"--smoke-batches must be a positive integer (> 0), got {args.smoke_batches}.")
+    return args
 
 
 def execute_single_fold(
@@ -153,6 +157,8 @@ def execute_single_fold(
     """Configure and execute CCARC pipeline for a single LOCO fold."""
     data_yaml = resolve_fold_data_yaml(views_dir, fold_idx, target_country)
     experiment_name = f"fold_{fold_idx}_{target_country}_{args.variant}"
+    if args.smoke_batches is not None:
+        experiment_name += f"_smoke_{args.smoke_batches}b"
 
     # Build component configs
     cal_cfg = ClassAwareLearningConfig(
@@ -188,6 +194,7 @@ def execute_single_fold(
         local_run_dir=str(args.local_run_dir) if args.local_run_dir else "",
         experiment_name=experiment_name,
         resume=args.resume,
+        smoke_batches=args.smoke_batches,
     )
 
     trainer = CCARCLOCOTrainer(config)
@@ -226,6 +233,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Local Run Dir:     {args.local_run_dir}")
     print(f"Epochs:            {args.epochs} | Batch Size: {args.batch_size} | Img Size: {args.img_size}")
     print(f"Device:            {args.device} | Seed: {args.seed} | Optimizer: {args.optimizer}")
+    print(f"Smoke Batches:     {args.smoke_batches if args.smoke_batches is not None else 'Disabled (Normal Training)'}")
     print(f"Dry Run Mode:      {args.dry_run}")
     print(f"Eval Target Mode:  {args.eval_target or args.all_stages}")
 
@@ -251,6 +259,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.dry_run:
             if res.get("dry_run_report", {}).get("status") != "PASS":
+                any_failures = True
+        elif args.smoke_batches is not None:
+            if res.get("stage_1_train", {}).get("status") != "SMOKE_BATCHES_COMPLETE":
                 any_failures = True
         else:
             if args.eval_target or args.all_stages:

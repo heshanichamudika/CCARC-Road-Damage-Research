@@ -103,6 +103,9 @@ class CCARCTrainingConfig:
     save: bool = True
     save_period: int = -1
 
+    # 8. Mini-Debugging Smoke Mode
+    smoke_batches: Optional[int] = None
+
     # Metadata
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     ultralytics_version: str = field(default_factory=lambda: str(ultralytics.__version__))
@@ -110,6 +113,11 @@ class CCARCTrainingConfig:
 
     def __post_init__(self) -> None:
         """Enforce component toggles and naming based on experiment variant."""
+        if self.smoke_batches is not None:
+            if not isinstance(self.smoke_batches, int) or self.smoke_batches <= 0:
+                raise ValueError(
+                    f"smoke_batches must be a positive integer (> 0), got {self.smoke_batches}"
+                )
         self.apply_variant(self.experiment_variant)
         if not self.experiment_name:
             self.experiment_name = f"fold_{self.fold_idx}_{self.target_country}_{self.experiment_variant}"
