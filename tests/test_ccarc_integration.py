@@ -25,6 +25,7 @@ from src.models.ccarc_consistency import (
     ReliabilityConsistencyLoss,
 )
 from src.models.ccarc_loss import (
+    CCARCDetectionLoss,
     ClassAwareLearningConfig,
     ClassWeightedBCEWithLogitsLoss,
     compute_class_weights,
@@ -347,4 +348,99 @@ def test_custom_trainer_argument_separation(
     else:
         assert trainer.perturbation is None
         assert trainer.rwc_loss is None
+
+
+@pytest.mark.parametrize("variant,cal_active,rwc_active", [
+    ("E0", False, False),
+    ("E1", False, False),
+    ("E2", True, False),
+    ("E3", False, True),
+    ("E4", True, True),
+])
+def test_trainer_set_model_attributes_and_cal_activation(
+    tmp_path: Path, variant: str, cal_active: bool, rwc_active: bool
+):
+    """Verify trainer set_model_attributes attaches CAL and wraps RWC accurately per variant."""
+    import yaml
+
+    # Setup dummy directory with fold summary and labels
+    fold_dir = tmp_path / "fold_4_Norway"
+    labels_dir = fold_dir / "labels" / "train"
+    labels_dir.mkdir(parents=True, exist_ok=True)
+    (labels_dir / "img1.txt").write_text("0 0.5 0.5 0.2 0.2\n1 0.3 0.3 0.1 0.1\n")
+
+    summary_file = fold_dir / "fold_summary.json"
+    with open(summary_file, "w") as f:
+        json.dump({
+            "source_countries": ["Japan", "India", "Czech"],
+            "target_country": "Norway",
+            "class_counts": {"train": {"D00": 100, "D10": 50, "D20": 25, "D40": 10}},
+        }, f)
+
+    data_yaml = fold_dir / "data.yaml"
+    with open(data_yaml, "w") as f:
+        yaml.dump({
+            "path": str(fold_dir),
+            "train": ".",
+            "val": ".",
+            "names": {0: "D00", 1: "D10", 2: "D20", 3: "D40"},
+        }, f)
+
+    cfg = CCARCTrainingConfig(
+        experiment_variant=variant,
+        fold_idx=4,
+        target_country="Norway",
+        data_yaml_path=str(data_yaml),
+        project_dir=str(tmp_path / "experiments"),
+    )
+
+    overrides = {
+        "model": "yolov8s.yaml",
+        "data": str(data_yaml),
+        "trainer": CCARCDetectionTrainer,
+        "ccarc_config": cfg,
+        "cbs_enabled": cfg.cbs_enabled,
+        "cal_enabled": cfg.cal_enabled,
+        "rwc_enabled": cfg.rwc_enabled,
+        "target_country": cfg.target_country,
+        "project": str(tmp_path / "runs"),
+        "epochs": 1,
+        "batch": 2,
+    }
+
+    trainer = CCARCDetectionTrainer(overrides=overrides)
+    trainer.setup_model()
+    trainer.set_model_attributes()
+
+    # Check CAL status
+    if cal_active:
+        assert trainer.class_weights is not None
+        assert isinstance(trainer.model.criterion, CCARCDetectionLoss)
+        assert isinstance(trainer.model.criterion.bce, ClassWeightedBCEWithLogitsLoss)
+    else:
+        assert trainer.class_weights is None
+
+    # Check RWC status
+    if rwc_active:
+        assert getattr(trainer.model, "_ccarc_rwc_wrapped", False) is True
+    else:
+        assert getattr(trainer.model, "_ccarc_rwc_wrapped", False) is False
+
+    # Execute a real forward loss pass on trainer.model for E4
+    if variant == "E4":
+        batch = {
+            "batch_idx": torch.tensor([0, 1]),
+            "cls": torch.tensor([0, 1]),
+            "bboxes": torch.tensor([[0.5, 0.5, 0.2, 0.2], [0.3, 0.3, 0.1, 0.1]]),
+            "img": torch.rand(2, 3, 64, 64),
+        }
+        loss, loss_items = trainer.model(batch)
+        loss_scalar = loss.sum() if loss.ndim > 0 else loss
+        assert torch.isfinite(loss_scalar)
+        assert loss_scalar.item() > 0.0
+        loss_scalar.backward()
+        grads = [p.grad for p in trainer.model.parameters() if p.grad is not None]
+        assert len(grads) > 0
+        assert all(torch.isfinite(g).all() for g in grads)
+
 

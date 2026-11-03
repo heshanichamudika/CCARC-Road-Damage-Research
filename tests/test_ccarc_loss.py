@@ -21,10 +21,13 @@ import torch.nn as nn
 
 from src.data.loco_splitter import DEFAULT_TARGET_CLASSES
 from src.models.ccarc_loss import (
+    CCARCDetectionLoss,
     ClassAwareLearningConfig,
     ClassWeightedBCEWithLogitsLoss,
+    attach_class_aware_loss,
     compute_class_weights,
     extract_source_train_class_counts,
+    resolve_detection_model,
 )
 
 
@@ -233,3 +236,121 @@ def test_scalar_supervised_loss_extraction_across_ultralytics_formats():
     extracted_2.backward()
     assert vector_loss.grad is not None
     assert torch.allclose(vector_loss.grad, torch.ones_like(vector_loss))
+
+
+def test_sequential_object_missing_args_regression():
+    """Reproduce original failure: Sequential object lacks 'args' attribute."""
+    from types import SimpleNamespace
+    from ultralytics.nn.tasks import DetectionModel
+    from ultralytics.utils.loss import v8DetectionLoss
+
+    dm = DetectionModel("yolov8s.yaml", nc=4, verbose=False)
+    raw_sequential = dm.model  # torch.nn.Sequential
+
+    # 1. Assert raw Sequential has no 'args' attribute
+    assert isinstance(raw_sequential, torch.nn.Sequential)
+    assert not hasattr(raw_sequential, "args")
+
+    # 2. Passing raw Sequential to v8DetectionLoss reproduces exact AttributeError
+    with pytest.raises(AttributeError, match="'Sequential' object has no attribute 'args'"):
+        _ = v8DetectionLoss(raw_sequential)
+
+    # 3. resolve_detection_model raises TypeError if passed a bare Sequential
+    with pytest.raises(TypeError, match="Expected Ultralytics DetectionModel, but received torch.nn.Sequential"):
+        resolve_detection_model(raw_sequential)
+
+
+def test_cal_loss_initialization_with_detection_model():
+    """Verify CAL loss attaches to genuine DetectionModel across wrapper types."""
+    from types import SimpleNamespace
+    from ultralytics.nn.tasks import DetectionModel
+
+    dm = DetectionModel("yolov8s.yaml", nc=4, verbose=False)
+    dm.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5)
+
+    # 1. Resolve directly from DetectionModel
+    resolved = resolve_detection_model(dm)
+    assert resolved is dm
+    assert hasattr(resolved, "args")
+    assert hasattr(resolved, "loss")
+
+    # 2. Resolve from trainer-like container
+    trainer_mock = SimpleNamespace(model=dm, validator=True, args=dm.args)
+    assert resolve_detection_model(trainer_mock) is dm
+
+    # 3. Resolve from YOLO-like container
+    yolo_mock = SimpleNamespace(model=dm)
+    assert resolve_detection_model(yolo_mock) is dm
+
+    # 4. Resolve from DDP-like container
+    ddp_mock = SimpleNamespace(module=dm)
+    assert resolve_detection_model(ddp_mock) is dm
+
+    # 5. Attach CAL loss to DetectionModel
+    weights = torch.tensor([0.5, 1.5, 2.0, 1.0])
+    criterion = attach_class_aware_loss(dm, weights)
+
+    assert isinstance(criterion, CCARCDetectionLoss)
+    assert dm.criterion is criterion
+    assert hasattr(criterion, "bce")
+    assert torch.allclose(criterion.bce.class_weights, weights)
+    assert criterion.nc == 4
+    assert criterion.stride is not None
+
+
+def test_cal_finite_loss_and_backward_gradients():
+    """Verify forward and backward passes produce finite losses and gradients with CAL."""
+    from types import SimpleNamespace
+    from ultralytics.nn.tasks import DetectionModel
+
+    dm = DetectionModel("yolov8s.yaml", nc=4, verbose=False)
+    dm.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5)
+
+    weights = torch.tensor([0.7, 1.8, 2.5, 1.0])
+    attach_class_aware_loss(dm, weights)
+
+    batch = {
+        "batch_idx": torch.tensor([0, 1]),
+        "cls": torch.tensor([0, 2]),
+        "bboxes": torch.tensor([
+            [0.5, 0.5, 0.2, 0.2],
+            [0.3, 0.3, 0.1, 0.1],
+        ]),
+        "img": torch.rand(2, 3, 64, 64),
+    }
+
+    loss, loss_items = dm.loss(batch)
+
+    # Assert finite loss
+    loss_scalar = loss.sum() if loss.ndim > 0 else loss
+    assert torch.isfinite(loss_scalar)
+    assert loss_scalar.item() > 0.0
+    assert torch.isfinite(loss_items).all()
+
+    # Assert backward propagation produces valid gradients
+    loss_scalar.backward()
+    grads = [p.grad for p in dm.parameters() if p.grad is not None]
+    assert len(grads) > 0
+    assert all(torch.isfinite(g).all() for g in grads)
+    assert any((g != 0).any() for g in grads)
+
+
+def test_cal_class_weights_affect_classification_loss():
+    """Verify that class weights actively alter the classification loss component."""
+    pred = torch.zeros(1, 1, 4)  # logits
+    target = torch.ones(1, 1, 4)
+
+    # Loss with uniform weights
+    uniform_loss_fn = ClassWeightedBCEWithLogitsLoss(torch.tensor([1.0, 1.0, 1.0, 1.0]))
+    loss_uniform = uniform_loss_fn(pred, target)
+
+    # Loss with skewed weights: class 2 is 4x weight of class 0
+    skewed_weights = torch.tensor([0.5, 1.0, 2.0, 0.5])
+    skewed_loss_fn = ClassWeightedBCEWithLogitsLoss(skewed_weights)
+    loss_skewed = skewed_loss_fn(pred, target)
+
+    # Class 2 loss must be 4x of class 0 loss in skewed case
+    assert pytest.approx(loss_skewed[0, 0, 2].item() / loss_skewed[0, 0, 0].item(), rel=1e-4) == 4.0
+    # Class 0 loss in skewed case must be 0.5x of uniform
+    assert pytest.approx(loss_skewed[0, 0, 0].item() / loss_uniform[0, 0, 0].item(), rel=1e-4) == 0.5
+

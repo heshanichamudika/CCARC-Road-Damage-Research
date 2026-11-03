@@ -39,6 +39,7 @@ from src.models.ccarc_loss import (
     attach_class_aware_loss,
     compute_class_weights,
     extract_source_train_class_counts,
+    resolve_detection_model,
 )
 from src.models.ccarc_perturbations import (
     PhotometricPerturbation,
@@ -195,7 +196,7 @@ class CCARCDetectionTrainer(DetectionTrainer):
 
     def _wrap_model_with_rwc(self) -> None:
         """Wrap model.loss() to compute dual weak/strong forward passes and consistency loss."""
-        raw_model = getattr(self.model, "model", self.model)
+        raw_model = resolve_detection_model(self.model)
         orig_loss_fn = getattr(raw_model, "loss", None)
 
         if orig_loss_fn is None or getattr(raw_model, "_ccarc_rwc_wrapped", False):

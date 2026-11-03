@@ -11,6 +11,7 @@ from src.models.ccarc_loss import (
     attach_class_aware_loss,
     compute_class_weights,
     extract_source_train_class_counts,
+    resolve_detection_model,
 )
 from src.models.ccarc_perturbations import (
     PhotometricPerturbation,
@@ -24,6 +25,7 @@ __all__ = [
     "ClassWeightedBCEWithLogitsLoss",
     "CCARCDetectionLoss",
     "attach_class_aware_loss",
+    "resolve_detection_model",
     "PhotometricPerturbation",
     "PhotometricPerturbationConfig",
     "ReliabilityConsistencyConfig",

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -328,6 +329,43 @@ class CCARCDetectionLoss(v8DetectionLoss):
         self.bce.set_class_weights(self.class_weights)
 
 
+def resolve_detection_model(model: Any) -> Any:
+    """Resolve genuine Ultralytics DetectionModel from YOLO wrapper, trainer, or DDP module.
+
+    Ensures that an internal torch.nn.Sequential (e.g. DetectionModel.model) is NEVER
+    returned as the detection model.
+
+    Args:
+        model: A YOLO object, BaseTrainer object, DetectionModel, DDP/DP wrapper, or module.
+
+    Returns:
+        The underlying DetectionModel instance.
+    """
+    # 1. If trainer object passed (has .model and .validator or .args)
+    if hasattr(model, "model") and hasattr(model, "validator") and hasattr(model, "args"):
+        model = model.model
+
+    # 2. Unwrap DistributedDataParallel / DataParallel
+    if hasattr(model, "module"):
+        model = model.module
+
+    # 3. If YOLO wrapper (has .model, but model.model is NOT Sequential)
+    # Note: DetectionModel also has .model, but its .model is torch.nn.Sequential!
+    if hasattr(model, "model") and not isinstance(model.model, torch.nn.Sequential):
+        model = model.model
+        if hasattr(model, "module"):
+            model = model.module
+
+    # 4. Final safety check: if model is torch.nn.Sequential, raise an informative TypeError
+    if isinstance(model, torch.nn.Sequential):
+        raise TypeError(
+            f"Expected Ultralytics DetectionModel, but received torch.nn.Sequential. "
+            f"Cannot operate on raw layer container without DetectionModel attributes (args, criterion, loss)."
+        )
+
+    return model
+
+
 def attach_class_aware_loss(
     model: Any,
     class_weights: Optional[torch.Tensor],
@@ -339,21 +377,26 @@ def attach_class_aware_loss(
     or initializing CCARCDetectionLoss.
 
     Args:
-        model: Ultralytics YOLO or DetectionModel instance.
+        model: Ultralytics YOLO, DetectionTrainer, or DetectionModel instance.
         class_weights: Tensor of class weights of shape (num_classes,).
         tal_topk: TaskAlignedAssigner top-k parameter.
 
     Returns:
         The updated loss criterion attached to model.criterion.
     """
-    underlying_model = getattr(model, "model", model)
+    det_model = resolve_detection_model(model)
+
+    # Ensure model has args attribute for v8DetectionLoss if missing
+    if getattr(det_model, "args", None) is None:
+        det_model.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5)
 
     # 1. If model already has a criterion with .bce attribute, inject ClassWeightedBCEWithLogitsLoss
-    if hasattr(underlying_model, "criterion") and hasattr(underlying_model.criterion, "bce"):
-        underlying_model.criterion.bce = ClassWeightedBCEWithLogitsLoss(class_weights)
-        return underlying_model.criterion
+    if hasattr(det_model, "criterion") and getattr(det_model, "criterion", None) is not None:
+        if hasattr(det_model.criterion, "bce"):
+            det_model.criterion.bce = ClassWeightedBCEWithLogitsLoss(class_weights)
+            return det_model.criterion
 
     # 2. Otherwise instantiate CCARCDetectionLoss
-    criterion = CCARCDetectionLoss(underlying_model, class_weights=class_weights, tal_topk=tal_topk)
-    underlying_model.criterion = criterion
+    criterion = CCARCDetectionLoss(det_model, class_weights=class_weights, tal_topk=tal_topk)
+    det_model.criterion = criterion
     return criterion
