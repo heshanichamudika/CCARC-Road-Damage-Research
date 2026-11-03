@@ -13,6 +13,10 @@ from src.evaluation.report_generator import (
     EvaluationReportGenerator,
     VARIANT_DESCRIPTIONS,
 )
+from src.evaluation.rwc_gradient_verifier import (
+    RWCGradientAuditResult,
+    audit_rwc_gradients,
+)
 
 __all__ = [
     "compute_f1",
@@ -22,4 +26,6 @@ __all__ = [
     "LOCOBenchmarkEvaluator",
     "EvaluationReportGenerator",
     "VARIANT_DESCRIPTIONS",
+    "RWCGradientAuditResult",
+    "audit_rwc_gradients",
 ]
