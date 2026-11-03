@@ -157,6 +157,60 @@ class TestSmokeBatchesTrainer:
             assert len(exc_info.value.diagnostics) == 2
             assert exc_info.value.diagnostics[1]["batch"] == 2
 
+    def test_on_smoke_batch_end_with_dict_loss_items_regression(self):
+        """Regression test for ValueError: could not convert string to float: 'box_loss'.
+
+        When loss_items is a dictionary mapping loss names to tensors/floats,
+        keys like 'box_loss' must not be converted to floats.
+        """
+        cfg = CCARCTrainingConfig(experiment_variant="E4", smoke_batches=2)
+        overrides = {"model": "yolov8n.yaml", "epochs": 1, "smoke_batches": 2, "ccarc_config": cfg}
+        with patch("ultralytics.models.yolo.detect.train.DetectionTrainer.get_dataset", return_value=(None, None)):
+            trainer = CCARCDetectionTrainer(overrides=overrides)
+            trainer.loss = torch.tensor(2.4567)
+            # Exactly what triggered the ValueError: dict of loss names
+            trainer.loss_items = {
+                "box_loss": torch.tensor(0.8123),
+                "cls_loss": torch.tensor(1.2345),
+                "dfl_loss": 0.4099,
+            }
+            trainer._last_opt_step_ran = True
+            trainer._current_batch = {"im_file": ["/data/Norway_0001.jpg"]}
+
+            # Must execute without ValueError: could not convert string to float: 'box_loss'
+            trainer._on_smoke_batch_end(trainer)
+            assert trainer.smoke_batch_counter == 1
+            diag = trainer.smoke_diagnostics[0]
+            assert diag["loss_components"] == {"box": 0.8123, "cls": 1.2345, "dfl": 0.4099}
+            assert diag["cal"]["cls_loss"] == 1.2345
+
+    def test_on_smoke_batch_end_with_string_names_or_missing_losses(self):
+        """Verify non-numeric string labels or missing loss items are handled safely without raising."""
+        cfg = CCARCTrainingConfig(experiment_variant="E0", smoke_batches=3)
+        overrides = {"model": "yolov8n.yaml", "epochs": 1, "smoke_batches": 3, "ccarc_config": cfg}
+        with patch("ultralytics.models.yolo.detect.train.DetectionTrainer.get_dataset", return_value=(None, None)):
+            trainer = CCARCDetectionTrainer(overrides=overrides)
+            trainer.loss = None
+            # Strings in list: e.g. self.loss_names = ['box_loss', 'cls_loss', 'dfl_loss']
+            trainer.loss_items = ["box_loss", "cls_loss", "dfl_loss"]
+            trainer._current_batch = None
+
+            # Must execute without error
+            trainer._on_smoke_batch_end(trainer)
+            assert trainer.smoke_batch_counter == 1
+            diag = trainer.smoke_diagnostics[0]
+            assert diag["total_loss"] == "N/A"
+            assert diag["loss_components"] == {}
+
+            # Single float loss_items
+            trainer.loss = 1.95
+            trainer.loss_items = 1.95
+            trainer._on_smoke_batch_end(trainer)
+            assert trainer.smoke_batch_counter == 2
+            diag2 = trainer.smoke_diagnostics[1]
+            assert diag2["total_loss"] == 1.95
+            assert diag2["loss_components"] == {"loss": 1.95}
+
     def test_on_smoke_epoch_end_prevents_validation(self):
         """Verify _on_smoke_epoch_end raises CCARCSmokeBatchStop if epoch ends early."""
         cfg = CCARCTrainingConfig(experiment_variant="E0", smoke_batches=5)

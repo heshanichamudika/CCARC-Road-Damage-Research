@@ -330,14 +330,54 @@ class CCARCDetectionTrainer(DetectionTrainer):
 
         if hasattr(self, "loss_items") and self.loss_items is not None:
             raw_items = self.loss_items
-            if isinstance(raw_items, torch.Tensor):
-                items = [round(float(x.item()), 4) for x in raw_items.detach().cpu()]
-            else:
-                items = [round(float(x), 4) for x in raw_items]
-            if len(items) >= 3:
-                loss_items_dict = {"box": items[0], "cls": items[1], "dfl": items[2]}
-            elif len(items) == 1:
-                loss_items_dict = {"loss": items[0]}
+            if isinstance(raw_items, dict):
+                for k, v in raw_items.items():
+                    clean_k = str(k).replace("train/", "").replace("_loss", "")
+                    try:
+                        if isinstance(v, torch.Tensor):
+                            loss_items_dict[clean_k] = round(float(v.detach().cpu().item()), 4)
+                        elif isinstance(v, (int, float)):
+                            loss_items_dict[clean_k] = round(float(v), 4)
+                    except (ValueError, TypeError):
+                        pass
+            elif isinstance(raw_items, torch.Tensor):
+                tensor_detached = raw_items.detach().cpu()
+                if tensor_detached.ndim == 0:
+                    loss_items_dict = {"loss": round(float(tensor_detached.item()), 4)}
+                else:
+                    vals = [round(float(x.item()), 4) for x in tensor_detached.flatten()]
+                    if len(vals) >= 3:
+                        loss_items_dict = {"box": vals[0], "cls": vals[1], "dfl": vals[2]}
+                    elif len(vals) == 1:
+                        loss_items_dict = {"loss": vals[0]}
+                    else:
+                        loss_items_dict = {f"loss_{i}": v for i, v in enumerate(vals)}
+            elif isinstance(raw_items, (list, tuple)):
+                numeric_vals = []
+                for x in raw_items:
+                    if isinstance(x, torch.Tensor):
+                        try:
+                            numeric_vals.append(round(float(x.detach().cpu().item()), 4))
+                        except (ValueError, TypeError):
+                            pass
+                    elif isinstance(x, (int, float)):
+                        numeric_vals.append(round(float(x), 4))
+                    elif isinstance(x, (tuple, list)) and len(x) == 2 and isinstance(x[0], str):
+                        try:
+                            val = float(x[1].detach().cpu().item()) if isinstance(x[1], torch.Tensor) else float(x[1])
+                            loss_items_dict[x[0].replace("_loss", "")] = round(val, 4)
+                        except (ValueError, TypeError):
+                            pass
+                    # String loss names such as 'box_loss' are non-numeric labels and safely skipped
+                if numeric_vals and not loss_items_dict:
+                    if len(numeric_vals) >= 3:
+                        loss_items_dict = {"box": numeric_vals[0], "cls": numeric_vals[1], "dfl": numeric_vals[2]}
+                    elif len(numeric_vals) == 1:
+                        loss_items_dict = {"loss": numeric_vals[0]}
+                    else:
+                        loss_items_dict = {f"loss_{i}": v for i, v in enumerate(numeric_vals)}
+            elif isinstance(raw_items, (int, float)):
+                loss_items_dict = {"loss": round(float(raw_items), 4)}
 
         raw_m = resolve_detection_model(getattr(self, "model", None))
         loss_fn = getattr(raw_m, "loss", None)
@@ -356,12 +396,28 @@ class CCARCDetectionTrainer(DetectionTrainer):
                     reliable_anchor_count = int(rel_cnt)
         else:
             if hasattr(self, "loss") and self.loss is not None:
-                sup_loss_val = round(float(self.loss.item()), 4)
+                try:
+                    if isinstance(self.loss, torch.Tensor):
+                        sup_loss_val = round(float(self.loss.detach().cpu().item()), 4)
+                    else:
+                        sup_loss_val = round(float(self.loss), 4)
+                except Exception:
+                    sup_loss_val = "N/A"
+            elif loss_items_dict:
+                sup_loss_val = round(sum(loss_items_dict.values()), 4)
             con_loss_val = "N/A (RWC disabled)"
 
-        total_loss_val = (
-            round(float(self.loss.item()), 4) if hasattr(self, "loss") and self.loss is not None else "N/A"
-        )
+        total_loss_val = "N/A"
+        if hasattr(self, "loss") and self.loss is not None:
+            try:
+                if isinstance(self.loss, torch.Tensor):
+                    total_loss_val = round(float(self.loss.detach().cpu().item()), 4)
+                else:
+                    total_loss_val = round(float(self.loss), 4)
+            except Exception:
+                total_loss_val = "N/A"
+        elif sup_loss_val is not None and isinstance(sup_loss_val, (int, float)):
+            total_loss_val = sup_loss_val
 
         # 2. CAL Contribution
         cal_info: Dict[str, Any] = {"enabled": self.cal_enabled}
